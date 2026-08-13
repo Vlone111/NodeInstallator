@@ -6,17 +6,18 @@ export LC_ALL=C
 # Remnawave Panel 2.8.1 / Node 2.8.0 one-file edge wizard.
 #
 # Data plane:
-#   TCP/443 -> HAProxy SNI router -> RAW+REALITY or Caddy -> XHTTP packet-up
+#   TCP/443 -> HAProxy SNI router -> selected self/external RAW+REALITY or
+#              Caddy -> optional XHTTP auto (HTTP/2 normally selects stream-up)
 #   UDP/443 -> optional Hysteria2
 #
 # RAW uses a real local HTTPS site as REALITY's self-steal target.  Client Hosts
-# default to the Firefox uTLS fingerprint.  An optional second RAW Host applies
-# client-side ClientHello fragmentation; FinalMask is deliberately never placed
+# default to the Firefox uTLS fingerprint.  An optional isolated Host applies
+# client-side ClientHello fragmentation to one selected REALITY path; FinalMask is never placed
 # on a REALITY server inbound because Xray 26.6.27 has a known crash regression
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-13.4'
+SCRIPT_VERSION='2026-08-13.5'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -35,6 +36,7 @@ QUIET_UI="${RW_QUIET:-0}"
 
 RAW_BACKEND_PORT=18443
 XHTTP_BACKEND_PORT=18444
+EXTERNAL_REALITY_BACKEND_PORT=18445
 CADDY_BACKEND_PORT=19443
 HAPROXY_STATS_PORT=8404
 HYSTERIA_MASQ_PORT=19080
@@ -42,6 +44,7 @@ RAW_TEST_PORT=21081
 XHTTP_TEST_PORT=21082
 HYSTERIA_TEST_PORT=21083
 RAW_FRAGMENT_TEST_PORT=21084
+EXTERNAL_REALITY_TEST_PORT=21085
 
 STAGE_UFW_SNAPSHOT=''
 STAGE_TUNING_WAS_NEW=0
@@ -259,9 +262,13 @@ Recovery:
 Optional environment variables:
   RW_INSTALL_DIR, RW_NODE_NAME, RW_REALITY_SNI, RW_XHTTP_SNI, RW_EDGE_IPV4,
   RW_PANEL_IPV4, RW_ACME_EMAIL, RW_NODE_PORT, RW_NODE_SECRET_KEY,
-  RW_ENABLE_HYSTERIA=0|1, RW_ENABLE_RAW_FRAGMENT=0|1,
+  RW_ENABLE_SELF_REALITY=0|1, RW_ENABLE_EXTERNAL_REALITY=0|1,
+  RW_ENABLE_XHTTP=0|1, RW_ENABLE_HYSTERIA=0|1,
+  RW_EXTERNAL_REALITY_TARGET=host:443, RW_EXTERNAL_REALITY_SNI=host,
+  RW_ENABLE_RAW_FRAGMENT=0|1, RW_FRAGMENT_REALITY=self|external,
   RW_CLIENT_FINGERPRINT (default: firefox),
-  RW_RAW_HOST_UUID, RW_RAW_FRAGMENT_HOST_UUID, RW_XHTTP_HOST_UUID,
+  RW_RAW_HOST_UUID, RW_EXTERNAL_REALITY_HOST_UUID,
+  RW_RAW_FRAGMENT_HOST_UUID, RW_XHTTP_HOST_UUID,
   RW_HYSTERIA_HOST_UUID, RW_EXTRA_HOST_UUIDS=uuid5,uuid6,
   RW_BLOCK_CLIENT_QUIC=0|1, RW_APPLY_TUNING=0|1,
   RW_SKIP_DNS=1, RW_SKIP_UFW=1, RW_ENABLE_UFW=1, RW_SSH_PORT,
@@ -400,6 +407,148 @@ validate_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535))
 }
 
+normalize_external_target() {
+    local target="${1,,}"
+    case "${target}" in
+        amd) target='www.amd.com' ;;
+        tesla) target='www.tesla.com' ;;
+        dl.google|google|google-downloads) target='dl.google.com' ;;
+    esac
+    [[ "${target}" == *:* ]] || target+=':443'
+    printf '%s' "${target}"
+}
+
+validate_external_target_format() {
+    local target host port
+    target="$(normalize_external_target "$1")"
+    host="${target%:*}"
+    port="${target##*:}"
+    validate_fqdn "${host}" && [[ "${port}" == 443 ]]
+}
+
+probe_external_reality_target() {
+    local target="$1" sni="$2" quiet="${3:-0}" host port addresses tls_output xray_output timing sample
+    local -a address_list=()
+    local -a timing_samples=()
+    target="$(normalize_external_target "${target}")"
+    host="${target%:*}"
+    port="${target##*:}"
+    validate_external_target_format "${target}" || return 1
+    validate_fqdn "${sni}" || return 1
+    [[ "${host}" == "${sni}" ]] || return 1
+    addresses="$(getent ahostsv4 "${host}" 2>/dev/null | awk '$2 == "STREAM" {print $1}' | sort -u)"
+    [[ -n "${addresses}" ]] || return 1
+    mapfile -t address_list <<<"${addresses}"
+    if ! python3 - "${EDGE_IPV4:-192.0.2.1}" "${address_list[@]}" <<'PY' >/dev/null 2>&1
+import ipaddress, sys
+edge = ipaddress.ip_address(sys.argv[1])
+for value in sys.argv[2:]:
+    address = ipaddress.ip_address(value)
+    assert address != edge
+    assert not (address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified)
+PY
+    then
+        return 1
+    fi
+    tls_output="$(timeout 12 openssl s_client -connect "${target}" -servername "${sni}" \
+        -tls1_3 -verify_hostname "${sni}" -verify_return_error -CApath /etc/ssl/certs \
+        -alpn 'h2,http/1.1' -brief </dev/null 2>&1 || true)"
+    grep -Fq 'Protocol version: TLSv1.3' <<<"${tls_output}" || return 1
+    grep -Fq 'Verification: OK' <<<"${tls_output}" || return 1
+    xray_output="$(timeout 20 docker run --rm --pull never --network host --cap-drop ALL \
+        --read-only --security-opt no-new-privileges:true \
+        --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" tls ping "${sni}" 2>&1 || true)"
+    [[ "$(grep -Fc 'Handshake succeeded' <<<"${xray_output}")" -ge 2 ]] || return 1
+    grep -Fq 'TLS Version:' <<<"${xray_output}" || return 1
+    grep -Fq 'TLS 1.3' <<<"${xray_output}" || return 1
+    for _ in 1 2 3; do
+        sample="$(curl --silent --show-error --output /dev/null --connect-timeout 4 --max-time 10 \
+            --write-out '%{time_appconnect}' "https://${sni}/" 2>/dev/null || true)"
+        if [[ "${sample}" =~ ^[0-9]+\.[0-9]+$ && "${sample}" != 0.000000 ]]; then
+            timing_samples+=("${sample}")
+        fi
+    done
+    if ((${#timing_samples[@]} >= 2)); then
+        timing="$(printf '%s\n' "${timing_samples[@]}" | sort -n | sed -n '2p')"
+    elif ((${#timing_samples[@]} == 1)); then
+        timing="${timing_samples[0]}"
+    else
+        timing='9.999999'
+    fi
+    EXTERNAL_TARGET_LAST_SCORE="${timing}"
+    EXTERNAL_TARGET_LAST_IPS="$(paste -sd, <<<"${addresses}")"
+    EXTERNAL_TARGET_LAST_PQ=0
+    grep -Eq 'TLS Post-Quantum key exchange:[[:space:]]+true' <<<"${xray_output}" && \
+        EXTERNAL_TARGET_LAST_PQ=1
+    if [[ "${quiet}" != 1 ]]; then
+        success "External REALITY target ${target} passed TLS 1.3, hostname and Xray probes (${EXTERNAL_TARGET_LAST_IPS})."
+        [[ "${EXTERNAL_TARGET_LAST_PQ}" == 1 ]] || \
+            warn "${target} did not negotiate post-quantum TLS in the current Xray probe."
+    fi
+}
+
+select_external_reality_target() {
+    local requested="${RW_EXTERNAL_REALITY_TARGET:-}" requested_sni="${RW_EXTERNAL_REALITY_SNI:-}"
+    local choice='' candidate best_target='' best_sni='' best_score='99.999999'
+    local -a candidates=('dl.google.com:443' 'www.amd.com:443' 'www.tesla.com:443')
+    if [[ -n "${requested}" ]]; then
+        EXTERNAL_REALITY_TARGET="$(normalize_external_target "${requested}")"
+        EXTERNAL_REALITY_SNI="${requested_sni:-${EXTERNAL_REALITY_TARGET%:*}}"
+        probe_external_reality_target "${EXTERNAL_REALITY_TARGET}" "${EXTERNAL_REALITY_SNI}" || \
+            die "External REALITY target ${EXTERNAL_REALITY_TARGET} failed DNS/TLS/Xray validation."
+        return 0
+    fi
+    if [[ "${NON_INTERACTIVE}" != 1 && -t 0 ]]; then
+        ui_section 'External REALITY target' 'measured from this Node; CDN answers are region-dependent'
+        cat <<'MENU'
+   1) Auto benchmark: Google Downloads, AMD and Tesla (recommended)
+   2) dl.google.com
+   3) www.amd.com
+   4) www.tesla.com
+   5) Custom hostname
+MENU
+        printf '\n%b?%b Select %b[1]%b: ' "${UI_CYAN}${UI_BOLD}" "${UI_RESET}" \
+            "${UI_DIM}" "${UI_RESET}"
+        IFS= read -r choice || die 'Input was interrupted.'
+        choice="${choice:-1}"
+        case "${choice}" in
+            1) ;;
+            2) candidates=('dl.google.com:443') ;;
+            3) candidates=('www.amd.com:443') ;;
+            4) candidates=('www.tesla.com:443') ;;
+            5)
+                EXTERNAL_REALITY_TARGET=''
+                EXTERNAL_REALITY_SNI=''
+                prompt_value EXTERNAL_REALITY_TARGET 'External REALITY target (hostname:443)'
+                EXTERNAL_REALITY_TARGET="$(normalize_external_target "${EXTERNAL_REALITY_TARGET}")"
+                prompt_value EXTERNAL_REALITY_SNI 'External REALITY SNI' "${EXTERNAL_REALITY_TARGET%:*}"
+                probe_external_reality_target "${EXTERNAL_REALITY_TARGET}" "${EXTERNAL_REALITY_SNI}" || \
+                    die "External REALITY target ${EXTERNAL_REALITY_TARGET} failed DNS/TLS/Xray validation."
+                return 0
+                ;;
+            *) die "Unknown external target choice: ${choice}" ;;
+        esac
+    fi
+    log 'Benchmarking external REALITY targets from this Node...'
+    for candidate in "${candidates[@]}"; do
+        if probe_external_reality_target "${candidate}" "${candidate%:*}" 1; then
+            log "Candidate ${candidate}: TLS=${EXTERNAL_TARGET_LAST_SCORE}s, IP=${EXTERNAL_TARGET_LAST_IPS}, PQ=${EXTERNAL_TARGET_LAST_PQ}."
+            if awk -v current="${EXTERNAL_TARGET_LAST_SCORE}" -v best="${best_score}" \
+                'BEGIN {exit !(current < best)}'; then
+                best_target="${candidate}"
+                best_sni="${candidate%:*}"
+                best_score="${EXTERNAL_TARGET_LAST_SCORE}"
+            fi
+        else
+            warn "Candidate ${candidate} failed the current DNS/TLS/Xray probe and was excluded."
+        fi
+    done
+    [[ -n "${best_target}" ]] || die 'No external REALITY preset passed validation; rerun with a verified custom target.'
+    EXTERNAL_REALITY_TARGET="${best_target}"
+    EXTERNAL_REALITY_SNI="${best_sni}"
+    success "Selected ${EXTERNAL_REALITY_TARGET} as the fastest currently valid regional target (TLS ${best_score}s)."
+}
+
 validate_hysteria_material() {
     local cert="${PRIVATE_DIR}/hysteria-tls/server.crt"
     local key="${PRIVATE_DIR}/hysteria-tls/server.key"
@@ -514,9 +663,14 @@ write_state() {
         printf 'PROFILE_NAME=%q\n' "${PROFILE_NAME}"
         printf 'RAW_TAG=%q\n' "${RAW_TAG}"
         printf 'XHTTP_TAG=%q\n' "${XHTTP_TAG}"
+        printf 'EXTERNAL_REALITY_TAG=%q\n' "${EXTERNAL_REALITY_TAG}"
         printf 'HYSTERIA_TAG=%q\n' "${HYSTERIA_TAG}"
+        printf 'ENABLE_SELF_REALITY=%q\n' "${ENABLE_SELF_REALITY}"
+        printf 'ENABLE_EXTERNAL_REALITY=%q\n' "${ENABLE_EXTERNAL_REALITY}"
+        printf 'ENABLE_XHTTP=%q\n' "${ENABLE_XHTTP}"
         printf 'ENABLE_HYSTERIA=%q\n' "${ENABLE_HYSTERIA}"
         printf 'ENABLE_RAW_FRAGMENT=%q\n' "${ENABLE_RAW_FRAGMENT}"
+        printf 'FRAGMENT_REALITY=%q\n' "${FRAGMENT_REALITY}"
         printf 'CLIENT_FINGERPRINT=%q\n' "${CLIENT_FINGERPRINT}"
         printf 'BLOCK_CLIENT_QUIC=%q\n' "${BLOCK_CLIENT_QUIC}"
         printf 'APPLY_TUNING=%q\n' "${APPLY_TUNING}"
@@ -527,9 +681,18 @@ write_state() {
         printf 'REALITY_PRIVATE_KEY=%q\n' "${REALITY_PRIVATE_KEY}"
         printf 'REALITY_PUBLIC_KEY=%q\n' "${REALITY_PUBLIC_KEY}"
         printf 'REALITY_SHORT_ID=%q\n' "${REALITY_SHORT_ID}"
+        [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || {
+            printf 'EXTERNAL_REALITY_TARGET=%q\n' "${EXTERNAL_REALITY_TARGET}"
+            printf 'EXTERNAL_REALITY_SNI=%q\n' "${EXTERNAL_REALITY_SNI}"
+            printf 'EXTERNAL_REALITY_PRIVATE_KEY=%q\n' "${EXTERNAL_REALITY_PRIVATE_KEY}"
+            printf 'EXTERNAL_REALITY_PUBLIC_KEY=%q\n' "${EXTERNAL_REALITY_PUBLIC_KEY}"
+            printf 'EXTERNAL_REALITY_SHORT_ID=%q\n' "${EXTERNAL_REALITY_SHORT_ID}"
+        }
         printf 'XHTTP_PATH=%q\n' "${XHTTP_PATH}"
         [[ "${ENABLE_HYSTERIA}" != 1 ]] || printf 'HYSTERIA_CERT_SHA256=%q\n' "${HYSTERIA_CERT_SHA256}"
         [[ -z "${RAW_HOST_UUID:-}" ]] || printf 'RAW_HOST_UUID=%q\n' "${RAW_HOST_UUID}"
+        [[ -z "${EXTERNAL_REALITY_HOST_UUID:-}" ]] || \
+            printf 'EXTERNAL_REALITY_HOST_UUID=%q\n' "${EXTERNAL_REALITY_HOST_UUID}"
         [[ -z "${RAW_FRAGMENT_HOST_UUID:-}" ]] || printf 'RAW_FRAGMENT_HOST_UUID=%q\n' "${RAW_FRAGMENT_HOST_UUID}"
         [[ -z "${XHTTP_HOST_UUID:-}" ]] || printf 'XHTTP_HOST_UUID=%q\n' "${XHTTP_HOST_UUID}"
         [[ -z "${HYSTERIA_HOST_UUID:-}" ]] || printf 'HYSTERIA_HOST_UUID=%q\n' "${HYSTERIA_HOST_UUID}"
@@ -554,21 +717,47 @@ load_state() {
     [[ "$(stat -c '%u' "${STATE_FILE}")" == 0 ]] || die 'state.env must be owned by root.'
     # shellcheck disable=SC1090
     source "${STATE_FILE}"
-    for required in REALITY_SNI XHTTP_SNI EDGE_IPV4 PANEL_IPV4 ACME_EMAIL NODE_PORT \
-        NODE_CODE NODE_CODE_LOWER PROFILE_NAME RAW_TAG XHTTP_TAG NODE_CONTAINER \
-        HAPROXY_CONTAINER CADDY_CONTAINER COMPOSE_PROJECT REALITY_PRIVATE_KEY \
-        REALITY_PUBLIC_KEY REALITY_SHORT_ID XHTTP_PATH; do
+    for required in REALITY_SNI EDGE_IPV4 PANEL_IPV4 ACME_EMAIL NODE_PORT \
+        NODE_CODE NODE_CODE_LOWER PROFILE_NAME NODE_CONTAINER HAPROXY_CONTAINER \
+        CADDY_CONTAINER COMPOSE_PROJECT; do
         [[ -n "${!required:-}" ]] || missing+=("${required}")
     done
     ((${#missing[@]} == 0)) || die "Incompatible state.env in ${INSTALL_DIR}; missing wizard fields: ${missing[*]}. Use the install directory that this wizard initialized."
     NODE_SLUG="${NODE_SLUG:-${NODE_CODE_LOWER:-legacy-node}}"
+    ENABLE_SELF_REALITY="${ENABLE_SELF_REALITY:-1}"
+    ENABLE_EXTERNAL_REALITY="${ENABLE_EXTERNAL_REALITY:-0}"
+    ENABLE_XHTTP="${ENABLE_XHTTP:-1}"
     ENABLE_HYSTERIA="${ENABLE_HYSTERIA:-0}"
     ENABLE_RAW_FRAGMENT="${ENABLE_RAW_FRAGMENT:-1}"
+    FRAGMENT_REALITY="${FRAGMENT_REALITY:-self}"
     CLIENT_FINGERPRINT="${CLIENT_FINGERPRINT:-firefox}"
     CLIENT_FINGERPRINT="${CLIENT_FINGERPRINT,,}"
     BLOCK_CLIENT_QUIC="${BLOCK_CLIENT_QUIC:-1}"
     APPLY_TUNING="${APPLY_TUNING:-0}"
+    XHTTP_SNI="${XHTTP_SNI:-${REALITY_SNI}}"
+    RAW_TAG="${RAW_TAG:-RW_${NODE_CODE}_RAW_REALITY_SELF}"
+    XHTTP_TAG="${XHTTP_TAG:-RW_${NODE_CODE}_XHTTP_TLS}"
+    EXTERNAL_REALITY_TAG="${EXTERNAL_REALITY_TAG:-RW_${NODE_CODE}_RAW_REALITY_EXTERNAL}"
     HYSTERIA_TAG="${HYSTERIA_TAG:-RW_${NODE_CODE}_HYSTERIA2}"
+
+    missing=()
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        for required in RAW_TAG REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY REALITY_SHORT_ID; do
+            [[ -n "${!required:-}" ]] || missing+=("${required}")
+        done
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        for required in EXTERNAL_REALITY_TAG EXTERNAL_REALITY_TARGET EXTERNAL_REALITY_SNI \
+            EXTERNAL_REALITY_PRIVATE_KEY EXTERNAL_REALITY_PUBLIC_KEY EXTERNAL_REALITY_SHORT_ID; do
+            [[ -n "${!required:-}" ]] || missing+=("${required}")
+        done
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        for required in XHTTP_TAG XHTTP_SNI XHTTP_PATH; do
+            [[ -n "${!required:-}" ]] || missing+=("${required}")
+        done
+    fi
+    ((${#missing[@]} == 0)) || die "Incomplete selected-transport state in ${INSTALL_DIR}: ${missing[*]}."
 }
 
 validate_fingerprint() {
@@ -593,7 +782,7 @@ pull_images() {
 }
 
 generate_material() {
-    local key_output
+    local key_output external_key_output
     key_output="$(docker run --rm --pull never --network none --cap-drop ALL --read-only \
         --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" x25519)"
     REALITY_PRIVATE_KEY="$(printf '%s\n' "${key_output}" | sed -nE \
@@ -605,6 +794,19 @@ generate_material() {
     [[ -n "${REALITY_PRIVATE_KEY}" && -n "${REALITY_PUBLIC_KEY}" ]] || die 'Xray did not generate REALITY keys.'
     [[ "${REALITY_SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] || die 'Invalid generated REALITY short ID.'
     [[ "${XHTTP_PATH}" =~ ^/api/v1/[0-9a-f]{48}/$ ]] || die 'Invalid generated XHTTP path.'
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        external_key_output="$(docker run --rm --pull never --network none --cap-drop ALL --read-only \
+            --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" x25519)"
+        EXTERNAL_REALITY_PRIVATE_KEY="$(printf '%s\n' "${external_key_output}" | sed -nE \
+            's/^(PrivateKey|Private key):[[:space:]]*//p' | head -n 1)"
+        EXTERNAL_REALITY_PUBLIC_KEY="$(printf '%s\n' "${external_key_output}" | sed -nE \
+            's/^(Password \(PublicKey\)|Password|PublicKey|Public key):[[:space:]]*//p' | head -n 1)"
+        EXTERNAL_REALITY_SHORT_ID="$(openssl rand -hex 8)"
+        [[ -n "${EXTERNAL_REALITY_PRIVATE_KEY}" && -n "${EXTERNAL_REALITY_PUBLIC_KEY}" ]] || \
+            die 'Xray did not generate external REALITY keys.'
+        [[ "${EXTERNAL_REALITY_SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] || \
+            die 'Invalid generated external REALITY short ID.'
+    fi
 }
 
 generate_hysteria_certificate() {
@@ -638,42 +840,7 @@ render_profile() {
       {"address": "https://8.8.8.8/dns-query", "timeoutMs": 2500}
     ]
   },
-  "inbounds": [
-    {
-      "tag": "${RAW_TAG}",
-      "listen": "127.0.0.1",
-      "port": ${RAW_BACKEND_PORT},
-      "protocol": "vless",
-      "settings": {"clients": [], "decryption": "none"},
-      "streamSettings": {
-        "network": "raw",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "target": "127.0.0.1:${CADDY_BACKEND_PORT}",
-          "xver": 0,
-          "serverNames": ["${REALITY_SNI}"],
-          "privateKey": "${REALITY_PRIVATE_KEY}",
-          "shortIds": ["${REALITY_SHORT_ID}"]
-        },
-        "sockopt": {"acceptProxyProtocol": true}
-      },
-      "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-    },
-    {
-      "tag": "${XHTTP_TAG}",
-      "listen": "127.0.0.1",
-      "port": ${XHTTP_BACKEND_PORT},
-      "protocol": "vless",
-      "settings": {"clients": [], "decryption": "none"},
-      "streamSettings": {
-        "network": "xhttp",
-        "security": "none",
-        "xhttpSettings": {"path": "${XHTTP_PATH}", "mode": "packet-up"}
-      },
-      "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
-    }
-  ],
+  "inbounds": [],
   "outbounds": [
     {"tag": "DIRECT", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
     {"tag": "BLOCK", "protocol": "blackhole"}
@@ -698,6 +865,68 @@ render_profile() {
   "stats": {}
 }
 EOF
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        jq --arg tag "${RAW_TAG}" --arg sni "${REALITY_SNI}" \
+            --arg private_key "${REALITY_PRIVATE_KEY}" --arg short_id "${REALITY_SHORT_ID}" \
+            --argjson port "${RAW_BACKEND_PORT}" --argjson cover_port "${CADDY_BACKEND_PORT}" '
+          .inbounds += [{
+            tag: $tag, listen: "127.0.0.1", port: $port, protocol: "vless",
+            settings: {clients: [], decryption: "none"},
+            streamSettings: {
+              network: "raw", security: "reality",
+              realitySettings: {
+                show: false, target: ("127.0.0.1:" + ($cover_port | tostring)), xver: 0,
+                serverNames: [$sni], privateKey: $private_key, shortIds: [$short_id]
+              },
+              sockopt: {acceptProxyProtocol: true}
+            },
+            sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+          }]
+        ' "${PRIVATE_DIR}/config-profile.ready.json" >"${PRIVATE_DIR}/config-profile.ready.json.tmp"
+        mv -f "${PRIVATE_DIR}/config-profile.ready.json.tmp" "${PRIVATE_DIR}/config-profile.ready.json"
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        jq --arg tag "${EXTERNAL_REALITY_TAG}" --arg target "${EXTERNAL_REALITY_TARGET}" \
+            --arg sni "${EXTERNAL_REALITY_SNI}" --arg private_key "${EXTERNAL_REALITY_PRIVATE_KEY}" \
+            --arg short_id "${EXTERNAL_REALITY_SHORT_ID}" \
+            --argjson port "${EXTERNAL_REALITY_BACKEND_PORT}" '
+          .inbounds += [{
+            tag: $tag, listen: "127.0.0.1", port: $port, protocol: "vless",
+            settings: {clients: [], decryption: "none"},
+            streamSettings: {
+              network: "raw", security: "reality",
+              realitySettings: {
+                show: false, target: $target, xver: 0, serverNames: [$sni],
+                privateKey: $private_key, shortIds: [$short_id],
+                limitFallbackUpload: {
+                  afterBytes: 4194304, bytesPerSec: 1048576, burstBytesPerSec: 4194304
+                },
+                limitFallbackDownload: {
+                  afterBytes: 4194304, bytesPerSec: 1048576, burstBytesPerSec: 4194304
+                }
+              },
+              sockopt: {acceptProxyProtocol: true}
+            },
+            sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+          }]
+        ' "${PRIVATE_DIR}/config-profile.ready.json" >"${PRIVATE_DIR}/config-profile.ready.json.tmp"
+        mv -f "${PRIVATE_DIR}/config-profile.ready.json.tmp" "${PRIVATE_DIR}/config-profile.ready.json"
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        jq --arg tag "${XHTTP_TAG}" --arg path "${XHTTP_PATH}" \
+            --argjson port "${XHTTP_BACKEND_PORT}" '
+          .inbounds += [{
+            tag: $tag, listen: "127.0.0.1", port: $port, protocol: "vless",
+            settings: {clients: [], decryption: "none"},
+            streamSettings: {
+              network: "xhttp", security: "none",
+              xhttpSettings: {path: $path, mode: "auto"}
+            },
+            sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true}
+          }]
+        ' "${PRIVATE_DIR}/config-profile.ready.json" >"${PRIVATE_DIR}/config-profile.ready.json.tmp"
+        mv -f "${PRIVATE_DIR}/config-profile.ready.json.tmp" "${PRIVATE_DIR}/config-profile.ready.json"
+    fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
         jq --rawfile cert "${PRIVATE_DIR}/hysteria-tls/server.crt" \
             --rawfile key "${PRIVATE_DIR}/hysteria-tls/server.key" \
@@ -786,22 +1015,53 @@ frontend public_tcp_443
     tcp-request inspect-delay 5s
     tcp-request content accept if { req.ssl_hello_type 1 }
     acl is_acme req.ssl_alpn -m sub acme-tls/1
-    acl is_reality req.ssl_sni -i "${REALITY_SNI}"
-    acl is_xhttp req.ssl_sni -i "${XHTTP_SNI}"
     use_backend caddy_tls if is_acme
+EOF
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        cat >>"${INSTALL_DIR}/haproxy.cfg" <<EOF
+    acl is_reality_self req.ssl_sni -i "${REALITY_SNI}"
+    use_backend xray_reality_self if is_reality_self
+EOF
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        cat >>"${INSTALL_DIR}/haproxy.cfg" <<EOF
+    acl is_reality_external req.ssl_sni -i "${EXTERNAL_REALITY_SNI}"
+    use_backend xray_reality_external if is_reality_external
+EOF
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        cat >>"${INSTALL_DIR}/haproxy.cfg" <<EOF
+    acl is_xhttp req.ssl_sni -i "${XHTTP_SNI}"
     use_backend caddy_tls if is_xhttp
-    use_backend xray_reality if is_reality
-    default_backend xray_reality
-
-backend xray_reality
-    mode tcp
-    option tcp-check
-    server xray_local 127.0.0.1:18443 send-proxy-v2 check inter 5s fall 3 rise 2
+EOF
+    fi
+    cat >>"${INSTALL_DIR}/haproxy.cfg" <<'EOF'
+    default_backend caddy_tls
 
 backend caddy_tls
     mode tcp
     option tcp-check
     server caddy_local 127.0.0.1:19443 check inter 2s fall 3 rise 1
+EOF
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        cat >>"${INSTALL_DIR}/haproxy.cfg" <<EOF
+
+backend xray_reality_self
+    mode tcp
+    option tcp-check
+    server xray_self 127.0.0.1:${RAW_BACKEND_PORT} send-proxy-v2 check inter 5s fall 3 rise 2
+EOF
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        cat >>"${INSTALL_DIR}/haproxy.cfg" <<EOF
+
+backend xray_reality_external
+    mode tcp
+    option tcp-check
+    server xray_external 127.0.0.1:${EXTERNAL_REALITY_BACKEND_PORT} send-proxy-v2 check inter 5s fall 3 rise 2
+EOF
+    fi
+    cat >>"${INSTALL_DIR}/haproxy.cfg" <<'EOF'
 
 listen local_stats
     bind 127.0.0.1:8404
@@ -880,6 +1140,9 @@ https://{$REALITY_SNI}:19443 {
 </urlset>` 200
     file_server
 }
+EOF
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        cat >>"${INSTALL_DIR}/Caddyfile" <<'EOF'
 
 https://{$XHTTP_SNI}:19443 {
     bind 127.0.0.1
@@ -910,6 +1173,7 @@ https://{$XHTTP_SNI}:19443 {
     }
 }
 EOF
+    fi
     chmod 0644 "${INSTALL_DIR}/Caddyfile"
 }
 
@@ -1150,14 +1414,25 @@ EOF
 
 render_auto_template() {
     local raw_uuid='__RAW_HOST_UUID__'
+    local external_uuid='__EXTERNAL_REALITY_HOST_UUID__'
     local raw_fragment_uuid='__RAW_FRAGMENT_HOST_UUID__'
     local xhttp_uuid='__XHTTP_HOST_UUID__'
-    local inject_placeholders
+    local hysteria_uuid='__HYSTERIA_HOST_UUID__'
+    local inject_placeholders='' ready=1 selected_json uuid
+    local -a selected_uuids extra_uuids
     local output="${PRIVATE_DIR}/xray-json-auto.template.json"
-    inject_placeholders="\"${raw_uuid}\", \"${xhttp_uuid}\""
-    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        inject_placeholders="\"${raw_uuid}\", \"${raw_fragment_uuid}\", \"${xhttp_uuid}\""
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        inject_placeholders+="${inject_placeholders:+, }\"${raw_uuid}\""
+        [[ "${ENABLE_RAW_FRAGMENT}" != 1 || "${FRAGMENT_REALITY}" != self ]] || \
+            inject_placeholders+=", \"${raw_fragment_uuid}\""
     fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        inject_placeholders+="${inject_placeholders:+, }\"${external_uuid}\""
+        [[ "${ENABLE_RAW_FRAGMENT}" != 1 || "${FRAGMENT_REALITY}" != external ]] || \
+            inject_placeholders+=", \"${raw_fragment_uuid}\""
+    fi
+    [[ "${ENABLE_XHTTP}" != 1 ]] || inject_placeholders+="${inject_placeholders:+, }\"${xhttp_uuid}\""
+    [[ "${ENABLE_HYSTERIA}" != 1 ]] || inject_placeholders+="${inject_placeholders:+, }\"${hysteria_uuid}\""
     cat >"${output}" <<EOF
 {
   "remnawave": {
@@ -1267,11 +1542,6 @@ render_auto_template() {
   ]
 }
 EOF
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        jq '.remnawave.injectHosts[0].selector.values += ["__HYSTERIA_HOST_UUID__"]' \
-            "${output}" >"${output}.tmp"
-        mv -f "${output}.tmp" "${output}"
-    fi
     if [[ "${BLOCK_CLIENT_QUIC}" == 1 ]]; then
         jq '.routing.rules |=
           (.[0:3] + [{type:"field", network:"udp", port:443, outboundTag:"block"}] + .[3:])' \
@@ -1279,128 +1549,97 @@ EOF
         mv -f "${output}.tmp" "${output}"
     fi
     chmod 0600 "${output}"
-    if [[ -n "${RAW_HOST_UUID:-}" && -n "${XHTTP_HOST_UUID:-}" && \
-          ( "${ENABLE_RAW_FRAGMENT}" != 1 || -n "${RAW_FRAGMENT_HOST_UUID:-}" ) && \
-          ( "${ENABLE_HYSTERIA}" != 1 || -n "${HYSTERIA_HOST_UUID:-}" ) ]]; then
-        jq --arg raw "${RAW_HOST_UUID}" --arg raw_fragment "${RAW_FRAGMENT_HOST_UUID:-}" \
-            --arg xhttp "${XHTTP_HOST_UUID}" \
-            --arg hysteria "${HYSTERIA_HOST_UUID:-}" \
-            --argjson enable_fragment "${ENABLE_RAW_FRAGMENT}" \
-            --argjson enable_hysteria "${ENABLE_HYSTERIA}" \
-            --arg extra "${EXTRA_HOST_UUIDS:-}" '
-            ($extra | split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))) as $extra_hosts |
-            .remnawave.injectHosts[0].selector.values =
-              ([$raw] +
-               (if $enable_fragment == 1 then [$raw_fragment] else [] end) +
-               [$xhttp] +
-               (if $enable_hysteria == 1 then [$hysteria] else [] end) +
-               $extra_hosts)
-        ' \
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        [[ -n "${RAW_HOST_UUID:-}" ]] && selected_uuids+=("${RAW_HOST_UUID}") || ready=0
+        if [[ "${ENABLE_RAW_FRAGMENT}" == 1 && "${FRAGMENT_REALITY}" == self ]]; then
+            [[ -n "${RAW_FRAGMENT_HOST_UUID:-}" ]] && selected_uuids+=("${RAW_FRAGMENT_HOST_UUID}") || ready=0
+        fi
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        [[ -n "${EXTERNAL_REALITY_HOST_UUID:-}" ]] && \
+            selected_uuids+=("${EXTERNAL_REALITY_HOST_UUID}") || ready=0
+        if [[ "${ENABLE_RAW_FRAGMENT}" == 1 && "${FRAGMENT_REALITY}" == external ]]; then
+            [[ -n "${RAW_FRAGMENT_HOST_UUID:-}" ]] && selected_uuids+=("${RAW_FRAGMENT_HOST_UUID}") || ready=0
+        fi
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        [[ -n "${XHTTP_HOST_UUID:-}" ]] && selected_uuids+=("${XHTTP_HOST_UUID}") || ready=0
+    fi
+    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
+        [[ -n "${HYSTERIA_HOST_UUID:-}" ]] && selected_uuids+=("${HYSTERIA_HOST_UUID}") || ready=0
+    fi
+    if [[ -n "${EXTRA_HOST_UUIDS:-}" ]]; then
+        IFS=',' read -r -a extra_uuids <<<"${EXTRA_HOST_UUIDS}"
+        for uuid in "${extra_uuids[@]}"; do [[ -z "${uuid}" ]] || selected_uuids+=("${uuid}"); done
+    fi
+    if [[ "${ready}" == 1 ]]; then
+        selected_json="$(printf '%s\n' "${selected_uuids[@]}" | jq -R . | jq -s .)"
+        jq --argjson selected "${selected_json}" \
+            '.remnawave.injectHosts[0].selector.values = $selected' \
             "${output}" >"${PRIVATE_DIR}/xray-json-auto.ready.json"
         chmod 0600 "${PRIVATE_DIR}/xray-json-auto.ready.json"
     fi
 }
 
+selected_primary_inbound_tag() {
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then printf '%s' "${RAW_TAG}"
+    elif [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then printf '%s' "${EXTERNAL_REALITY_TAG}"
+    elif [[ "${ENABLE_XHTTP}" == 1 ]]; then printf '%s' "${XHTTP_TAG}"
+    else printf '%s' "${HYSTERIA_TAG}"
+    fi
+}
+
+selected_inbound_tags_csv() {
+    local value=''
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || value+="${value:+, }${RAW_TAG}"
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || value+="${value:+, }${EXTERNAL_REALITY_TAG}"
+    [[ "${ENABLE_XHTTP}" != 1 ]] || value+="${value:+, }${XHTTP_TAG}"
+    [[ "${ENABLE_HYSTERIA}" != 1 ]] || value+="${value:+, }${HYSTERIA_TAG}"
+    printf '%s' "${value}"
+}
+
 render_panel_stage_one() {
-    local hysteria_tag_line='' active_inbounds="${RAW_TAG}, ${XHTTP_TAG}"
-    local hysteria_host='' fragment_host=''
-    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        fragment_host="
-5. PHYSICAL HOST — RAW REALITY / FIREFOX / CLIENT FRAGMENT
-   This is a second client representation of the SAME RAW inbound. It does not
-   create another listener and does not require another user credential.
-
-   Remark: RW ${NODE_CODE} RAW FF FRAGMENT
-   Inbound: ${RAW_TAG}
-   Address: ${EDGE_IPV4}
-   Port: 443
-   Advanced -> Fingerprint: ${CLIENT_FINGERPRINT}
-   Advanced -> FinalMask: paste the whole object from:
-     ${INSTALL_DIR}/finalmask-fragment-canary.json
-   Leave SNI, Host, Path, ALPN, Security Layer, Mux, SockOpt and Vless Route ID
-   at their defaults/empty values.
-   Host Visibility: ON (enabled)
-   Hide Host: ON
-   Tag: ${NODE_CODE}:RAW:FF:FRAG (optional, administrative only)
-   Nodes: optional visual metadata
-
-   IMPORTANT: FinalMask belongs only to this Host/client. Never paste it into
-   the Config Profile or a server REALITY inbound on Xray 26.6.27."
-    fi
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        hysteria_tag_line="   - ${HYSTERIA_TAG}"
-        active_inbounds="${active_inbounds}, ${HYSTERIA_TAG}"
-        hysteria_host="
-7. PHYSICAL HOST — HYSTERIA2 / UDP 443
-   Remark: RW ${NODE_CODE} HY2
-   Inbound: ${HYSTERIA_TAG}
-   Address: ${EDGE_IPV4}
-   Port: 443
-   Advanced -> SNI: ${XHTTP_SNI}
-   Advanced -> Security Layer: TLS
-   Advanced -> Fingerprint: ${CLIENT_FINGERPRINT}
-   Advanced -> ALPN: h3
-   Advanced -> Pinned Peer Certificate SHA256: ${HYSTERIA_CERT_SHA256}
-   Leave Host, Path, Mux, SockOpt, FinalMask and Vless Route ID empty/default.
-   Host Visibility: ON (enabled)
-   Hide Host: ON
-   Tag: ${NODE_CODE}:HY2 (optional, administrative only)
-   Nodes: optional visual metadata
-
-The certificate is a generated CA:FALSE leaf and is authenticated by the pin;
-do not enable allowInsecure. UDP hopping and Salamander are intentionally off."
-    fi
-    cat >"${PRIVATE_DIR}/PANEL-STAGE-1.txt" <<EOF
-REMNAWAVE PANEL 2.8.1 — STAGE 1
-================================
-
-1. CONFIG PROFILE
-   Config Profiles -> Create
-   Name: ${PROFILE_NAME}
-   Paste the whole file:
-   ${PRIVATE_DIR}/config-profile.ready.json
-
-   Expected inbound tags:
-   - ${RAW_TAG}
-   - ${XHTTP_TAG}
-${hysteria_tag_line}
-
-2. NODE
-   Internal name: RW-${NODE_CODE}
-   Country: choose the actual server country
-   Address: ${EDGE_IPV4}
-   Port: ${NODE_PORT}
-   Config Profile: ${PROFILE_NAME}
-   Active Inbounds: ${active_inbounds}
-   Plugin: None / disabled
-   Tags: ${NODE_CODE}:EDGE (optional, administrative only)
-   Traffic multipliers: 1.0 / 1.0
-
-   Save the Node, copy the newly issued SECRET_KEY, then run:
-   sudo bash <this-script> node
-
-3. ACCESS AFTER NODE IS ONLINE
-   Create an Internal Squad such as RW-${NODE_CODE}-CANARY.
-   Attach exactly these active inbounds: ${active_inbounds}.
-   Add one ACTIVE canary user to that squad. HWID should be off for the first test.
-
-4. PHYSICAL HOST — RAW REALITY
-   Remark: RW ${NODE_CODE} RAW FF
+    local active_inbounds primary_tag self_section='' external_section=''
+    local xhttp_section='' hysteria_section='' fragment_section='' base_tag base_name base_sni_line
+    active_inbounds="$(selected_inbound_tags_csv)"
+    primary_tag="$(selected_primary_inbound_tag)"
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        self_section="
+PHYSICAL HOST — RAW/TCP REALITY SELF-SNI
+   Remark: RW ${NODE_CODE} REALITY SELF FF
    Inbound: ${RAW_TAG}
    Address: ${EDGE_IPV4}
    Port: 443
    Advanced -> Fingerprint: ${CLIENT_FINGERPRINT}
    Leave SNI, Host, Path, ALPN, Security Layer, Mux, SockOpt, FinalMask and
-   Vless Route ID at their defaults/empty values. Panel 2.8.1 derives SNI,
-   REALITY public key, shortId and Vision flow from the selected inbound.
-   Host Visibility: ON (enabled)
+   Vless Route ID empty/default. Panel inherits self-SNI, key and shortId.
+   Host Visibility: ON
    Hide Host: ON
-   Tag: ${NODE_CODE}:RAW:FF (optional, administrative only)
+   Tag: ${NODE_CODE}:REALITY:SELF (administrative only)
+   Nodes: optional visual metadata"
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        external_section="
+PHYSICAL HOST — RAW/TCP REALITY EXTERNAL TARGET
+   Remark: RW ${NODE_CODE} REALITY EXT FF
+   Inbound: ${EXTERNAL_REALITY_TAG}
+   Address: ${EDGE_IPV4}
+   Port: 443
+   Advanced -> SNI: ${EXTERNAL_REALITY_SNI}
+   Advanced -> Fingerprint: ${CLIENT_FINGERPRINT}
+   Leave Host, Path, ALPN, Security Layer, Mux, SockOpt, FinalMask and
+   Vless Route ID empty/default. Panel inherits the dedicated key and shortId.
+   Host Visibility: ON
+   Hide Host: ON
+   Tag: ${NODE_CODE}:REALITY:EXTERNAL (administrative only)
    Nodes: optional visual metadata
 
-${fragment_host}
-
-6. PHYSICAL HOST — TLS/XHTTP
+   Measured target at init: ${EXTERNAL_REALITY_TARGET}
+   Re-run init/verify after target DNS, certificate or reachability changes."
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        xhttp_section="
+PHYSICAL HOST — VLESS XHTTP / TLS
    Remark: RW ${NODE_CODE} XHTTP FF
    Inbound: ${XHTTP_TAG}
    Address: ${EDGE_IPV4}
@@ -1410,106 +1649,166 @@ ${fragment_host}
    Advanced -> Security Layer: TLS
    Advanced -> Fingerprint: ${CLIENT_FINGERPRINT}
    Advanced -> ALPN: h2
-   Leave Path empty: Panel inherits ${XHTTP_PATH} from the inbound. Mode is
-   inherited as packet-up. Leave XHTTP Extra Params, Mux, SockOpt, FinalMask
-   and Vless Route ID empty/default.
-   Host Visibility: ON (enabled)
+   Leave Path empty: Panel inherits the generated trailing-slash path and
+   auto mode. Leave XHTTP Extra, Mux, SockOpt and FinalMask empty.
+   Host Visibility: ON
    Hide Host: ON
-   Tag: ${NODE_CODE}:XHTTP:FF (optional, administrative only)
+   Tag: ${NODE_CODE}:XHTTP (administrative only)
+   Nodes: optional visual metadata"
+    fi
+    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
+        hysteria_section="
+PHYSICAL HOST — HYSTERIA2 / UDP 443
+   Remark: RW ${NODE_CODE} HY2
+   Inbound: ${HYSTERIA_TAG}
+   Address: ${EDGE_IPV4}
+   Port: 443
+   Advanced -> SNI: ${XHTTP_SNI}
+   Advanced -> Security Layer: TLS
+   Advanced -> Fingerprint: ${CLIENT_FINGERPRINT}
+   Advanced -> ALPN: h3
+   Advanced -> Pinned Peer Certificate SHA256: ${HYSTERIA_CERT_SHA256}
+   Leave Host, Path, Mux, SockOpt and FinalMask empty/default.
+   Host Visibility: ON
+   Hide Host: ON
+   Tag: ${NODE_CODE}:HY2 (administrative only)
    Nodes: optional visual metadata
 
-${hysteria_host}
+   Do not enable allowInsecure. UDP hopping and Salamander stay off."
+    fi
+    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
+        if [[ "${FRAGMENT_REALITY}" == external ]]; then
+            base_tag="${EXTERNAL_REALITY_TAG}"; base_name='EXTERNAL'
+            base_sni_line="Advanced -> SNI: ${EXTERNAL_REALITY_SNI}"
+        else
+            base_tag="${RAW_TAG}"; base_name='SELF'
+            base_sni_line='Advanced -> SNI: leave empty (inherit from inbound)'
+        fi
+        fragment_section="
+PHYSICAL HOST — REALITY ${base_name} / CLIENT FRAGMENT A/B
+   This is another Host for the same inbound, not another listener.
+   Remark: RW ${NODE_CODE} REALITY ${base_name} FRAGMENT
+   Inbound: ${base_tag}
+   Address: ${EDGE_IPV4}
+   Port: 443
+   ${base_sni_line}
+   Advanced -> Fingerprint: ${CLIENT_FINGERPRINT}
+   Advanced -> FinalMask: paste the whole object from:
+     ${INSTALL_DIR}/finalmask-fragment-canary.json
+   Leave all other overrides empty/default.
+   Host Visibility: ON
+   Hide Host: ON
+   Tag: ${NODE_CODE}:REALITY:${base_name}:FRAGMENT (administrative only)
 
-Save all enabled physical Hosts and copy their HOST UUID values (not user UUID
-and not inbound UUID).
-Then run: sudo bash <this-script> template
+   FinalMask is client-side only. Never paste it into the server profile."
+    fi
+    cat >"${PRIVATE_DIR}/PANEL-STAGE-1.txt" <<EOF
+REMNAWAVE PANEL 2.8.1 — STAGE 1
+================================
 
-Do not type a public key, shortId, flow or any "public id" into a Host. Those
-values are generated/inherited by Remnawave 2.8.1 from the selected inbound.
+1. CONFIG PROFILE
+   Config Profiles -> Create
+   Name: ${PROFILE_NAME}
+   Paste the whole protected file:
+   ${PRIVATE_DIR}/config-profile.ready.json
+
+   Selected managed inbound tags: ${active_inbounds}
+
+2. NODE
+   Internal name: RW-${NODE_CODE}
+   Country: actual server country
+   Address: ${EDGE_IPV4}
+   Port: ${NODE_PORT}
+   Config Profile: ${PROFILE_NAME}
+   Active Inbounds: ${active_inbounds}
+   Plugin: None / disabled
+   Tags: ${NODE_CODE}:EDGE (administrative only)
+   Traffic multipliers: 1.0 / 1.0
+
+   Save, copy the newly issued SECRET_KEY, then run:
+   sudo bash <this-script> node
+
+3. ACCESS AFTER NODE IS ONLINE
+   Create Internal Squad RW-${NODE_CODE}-CANARY.
+   Attach exactly: ${active_inbounds}
+   Add one ACTIVE canary user. Keep HWID off for the first test.
+
+4. CREATE ONLY THE SELECTED PHYSICAL HOSTS
+${self_section}
+${external_section}
+${fragment_section}
+${xhttp_section}
+${hysteria_section}
+
+Save every physical Host and copy HOST UUID values (not user/inbound UUIDs),
+then run: sudo bash <this-script> template
+
+Do not type a public key, shortId, flow or public id into a Host. Remnawave
+2.8.1 derives those values from the selected managed inbound.
+
+The later AUTO carrier Host must bind to: ${primary_tag}
 EOF
     chmod 0600 "${PRIVATE_DIR}/PANEL-STAGE-1.txt"
 }
 
 render_panel_stage_two() {
-    [[ -n "${RAW_HOST_UUID:-}" && -n "${XHTTP_HOST_UUID:-}" ]] || return 0
-    [[ "${ENABLE_RAW_FRAGMENT}" != 1 || -n "${RAW_FRAGMENT_HOST_UUID:-}" ]] || return 0
-    [[ "${ENABLE_HYSTERIA}" != 1 || -n "${HYSTERIA_HOST_UUID:-}" ]] || return 0
-    local hysteria_uuid_line='' fragment_uuid_line='' physical_count=2
+    local primary_tag physical_count=0 uuid_lines=''
+    primary_tag="$(selected_primary_inbound_tag)"
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        [[ -n "${RAW_HOST_UUID:-}" ]] || return 0
+        uuid_lines+="Self-SNI REALITY Host UUID: ${RAW_HOST_UUID}\n"; physical_count=$((physical_count + 1))
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        [[ -n "${EXTERNAL_REALITY_HOST_UUID:-}" ]] || return 0
+        uuid_lines+="External REALITY Host UUID: ${EXTERNAL_REALITY_HOST_UUID}\n"; physical_count=$((physical_count + 1))
+    fi
     if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        fragment_uuid_line="Physical RAW Fragment Host UUID: ${RAW_FRAGMENT_HOST_UUID}"
-        physical_count=$((physical_count + 1))
+        [[ -n "${RAW_FRAGMENT_HOST_UUID:-}" ]] || return 0
+        uuid_lines+="REALITY Fragment Host UUID: ${RAW_FRAGMENT_HOST_UUID}\n"; physical_count=$((physical_count + 1))
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        [[ -n "${XHTTP_HOST_UUID:-}" ]] || return 0
+        uuid_lines+="XHTTP Host UUID: ${XHTTP_HOST_UUID}\n"; physical_count=$((physical_count + 1))
     fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        hysteria_uuid_line="Physical Hysteria2 Host UUID: ${HYSTERIA_HOST_UUID}"
-        physical_count=$((physical_count + 1))
+        [[ -n "${HYSTERIA_HOST_UUID:-}" ]] || return 0
+        uuid_lines+="Hysteria2 Host UUID: ${HYSTERIA_HOST_UUID}\n"; physical_count=$((physical_count + 1))
     fi
     cat >"${PRIVATE_DIR}/PANEL-STAGE-2.txt" <<EOF
 REMNAWAVE PANEL 2.8.1 — STAGE 2
 ================================
 
-Physical RAW Host UUID: ${RAW_HOST_UUID}
-${fragment_uuid_line}
-Physical XHTTP Host UUID: ${XHTTP_HOST_UUID}
-${hysteria_uuid_line}
-Additional physical Host UUIDs: ${EXTRA_HOST_UUIDS:-none}
+$(printf '%b' "${uuid_lines}")Additional physical Host UUIDs: ${EXTRA_HOST_UUIDS:-none}
 
 1. XRAY_JSON TEMPLATE
    Create template: RW-${NODE_CODE}-AUTO
    Paste the whole strict JSON file:
    ${PRIVATE_DIR}/xray-json-auto.ready.json
 
-2. AUTO HOST
-   A Host cannot exist without an inbound in Panel 2.8.1. Bind this carrier Host
-   to ${RAW_TAG}; the template does not add the carrier as an outbound.
-
+2. AUTO CARRIER HOST
+   Panel requires an inbound even though this Host only selects the template.
    Remark: RW ${NODE_CODE} AUTO
-   Inbound: ${RAW_TAG}
+   Inbound: ${primary_tag}
    Address: ${EDGE_IPV4}
    Port: 443
    Xray JSON Template: RW-${NODE_CODE}-AUTO
-   Leave every Advanced connection override at its default/empty value. This
-   carrier exists only because Panel 2.8.1 requires every Host to have an
-   inbound; the template intentionally does not emit it as another outbound.
-   Host Visibility: ON (enabled)
+   Advanced overrides: all empty/default
+   Host Visibility: ON
    Hide Host: OFF
-   Tag: ${NODE_CODE}:AUTO (optional, administrative only)
+   Tag: ${NODE_CODE}:AUTO (administrative only)
    Exclude formats: every format except XRAY_JSON
-   Exclude production squads during canary
+   Keep production squads excluded during canary.
 
-   Do NOT inject the AUTO Host UUID into the template. Only the ${physical_count}
-   enabled physical UUIDs above belong in remnawave.injectHosts.
+   Do not inject AUTO Host UUID. Only the ${physical_count} physical UUIDs above
+   and explicitly supplied cross-node UUIDs belong in injectHosts.
 
-   For real multi-node failover, add physical Host UUIDs from nodes in other
-   providers/ASNs to the same values array. On this server you can regenerate it
-   with RW_EXTRA_HOST_UUIDS=uuid3,uuid4 and rerun the template stage. This is
-   health-aware leastPing; DNS round-robin and Host.address lists are not.
+3. SUBSCRIPTION
+   Enable Serve JSON at base subscription. Keep built-in Response Rules and
+   happRouting unchanged. Happ/INCY users only press Refresh/Update.
 
-3. HAPP / INCY SUBSCRIPTION AND DNS
-   Subscription Settings -> Serve JSON at base subscription: ON.
-   Keep your existing built-in Response Rules unchanged. Do not add a scoped
-   Happ rule and do not replace Fallback Base64: Backend 2.8.1 recognizes both
-   Happ and INCY as native XRAY_JSON fallback clients when JSON-at-base is ON.
-   Keep happRouting empty. Give users the normal base subscription URL; no
-   /json suffix or per-user action is required beyond Refresh/Update.
-   Reference generated by the wizard:
-   ${PRIVATE_DIR}/SUBSCRIPTION-SETTINGS.txt
-
-   The client template captures port 53 and resolves through Cloudflare/Google
-   DoH inside the selected tunnel. It does not send plaintext DNS directly as a
-   fallback. Test with a physical-interface packet capture as well as a DNS
-   leak test: the latter alone cannot prove which interface carried a query.
-
-4. BASELINE FIRST
-   Keep FinalMask empty on normal RAW, XHTTP and Hysteria2 Hosts. The optional
-   hidden RAW Fragment Host is the isolated A/B canary and uses:
-   ${INSTALL_DIR}/finalmask-fragment-canary.json
-   Never put that object in the server Config Profile. Client fragmentation can
-   change a ClientHello signature; it cannot repair an IP/ASN route drop or a
-   Panel <-> Node N/A control-plane outage.
-
-After saving the template and AUTO Host, run:
-   sudo bash <this-script> edge
-   sudo bash <this-script> verify-auth
+4. TEST
+   Run edge, verify and verify-auth. Test every selected transport separately,
+   then AUTO in Happ/INCY TUN before expanding beyond the canary squad.
 EOF
     chmod 0600 "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
 }
@@ -1617,82 +1916,91 @@ write_node_env() {
 }
 
 validate_auto_template_model() {
-    local template="$1" temp_dir test_uuid injected finalmask xhttp_tag hysteria_tag
+    local template="$1" temp_dir test_uuid config tmp tag index=1
     temp_dir="$(mktemp -d)"
+    config="${temp_dir}/client.json"
+    tmp="${temp_dir}/next.json"
     test_uuid="$(docker run --rm --pull never --network none --cap-drop ALL --read-only \
         --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" uuid | tr -d '\r\n')"
-    injected="${temp_dir}/client-injected.json"
-    finalmask="${temp_dir}/client-finalmask.json"
-    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        xhttp_tag='proxy-3'
-        hysteria_tag='proxy-4'
-    else
-        xhttp_tag='proxy-2'
-        hysteria_tag='proxy-3'
+    jq 'del(.remnawave) | .outbounds = []' "${template}" >"${config}"
+    append_reality_test() {
+        local public_key="$1" short_id="$2" server_name="$3"
+        if ((index == 1)); then tag='proxy'; else tag="proxy-${index}"; fi
+        jq --arg tag "${tag}" --arg uuid "${test_uuid}" --arg public_key "${public_key}" \
+            --arg short_id "${short_id}" --arg server_name "${server_name}" \
+            --arg fingerprint "${CLIENT_FINGERPRINT}" '
+          .outbounds += [{
+            tag: $tag, protocol: "vless",
+            settings: {vnext: [{address: "127.0.0.1", port: 10443,
+              users: [{id: $uuid, encryption: "none", flow: "xtls-rprx-vision"}]}]},
+            streamSettings: {network: "raw", security: "reality", realitySettings: {
+              fingerprint: $fingerprint, serverName: $server_name,
+              publicKey: $public_key, shortId: $short_id, spiderX: "/"
+            }}
+          }]
+        ' "${config}" >"${tmp}"
+        mv -f "${tmp}" "${config}"
+        index=$((index + 1))
+    }
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        append_reality_test "${REALITY_PUBLIC_KEY}" "${REALITY_SHORT_ID}" 'reality.example.com'
+        [[ "${ENABLE_RAW_FRAGMENT}" != 1 || "${FRAGMENT_REALITY}" != self ]] || \
+            append_reality_test "${REALITY_PUBLIC_KEY}" "${REALITY_SHORT_ID}" 'reality.example.com'
     fi
-    jq --arg uuid "${test_uuid}" --arg public_key "${REALITY_PUBLIC_KEY}" \
-        --arg short_id "${REALITY_SHORT_ID}" --arg fingerprint "${CLIENT_FINGERPRINT}" \
-        --arg xhttp_tag "${xhttp_tag}" '
-        del(.remnawave) |
-        .outbounds = ([
-          {
-            tag: "proxy", protocol: "vless",
-            settings: {vnext: [{address: "127.0.0.1", port: 10443, users: [{id: $uuid, encryption: "none", flow: "xtls-rprx-vision"}]}]},
-            streamSettings: {network: "raw", security: "reality", realitySettings: {fingerprint: $fingerprint, serverName: "reality.test", publicKey: $public_key, shortId: $short_id, spiderX: "/"}}
-          },
-          {
-            tag: $xhttp_tag, protocol: "vless",
-            settings: {vnext: [{address: "127.0.0.1", port: 10443, users: [{id: $uuid, encryption: "none"}]}]},
-            streamSettings: {network: "xhttp", security: "tls", tlsSettings: {serverName: "xhttp.test", fingerprint: $fingerprint, alpn: ["h2"]}, xhttpSettings: {host: "xhttp.test", path: "/api/v1/test/", mode: "packet-up"}}
-          }
-        ] + .outbounds)
-    ' "${template}" >"${injected}"
-    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        jq --slurpfile fm "${INSTALL_DIR}/finalmask-fragment-canary.json" '
-          (.outbounds[0] | .tag = "proxy-2" | .streamSettings.finalmask = $fm[0]) as $fragment |
-          .outbounds = [.["outbounds"][0], $fragment] + .outbounds[1:]
-        ' "${injected}" >"${injected}.tmp"
-        mv -f "${injected}.tmp" "${injected}"
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        append_reality_test "${EXTERNAL_REALITY_PUBLIC_KEY}" "${EXTERNAL_REALITY_SHORT_ID}" \
+            "${EXTERNAL_REALITY_SNI}"
+        [[ "${ENABLE_RAW_FRAGMENT}" != 1 || "${FRAGMENT_REALITY}" != external ]] || \
+            append_reality_test "${EXTERNAL_REALITY_PUBLIC_KEY}" "${EXTERNAL_REALITY_SHORT_ID}" \
+                "${EXTERNAL_REALITY_SNI}"
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        if ((index == 1)); then tag='proxy'; else tag="proxy-${index}"; fi
+        jq --arg tag "${tag}" --arg uuid "${test_uuid}" --arg fingerprint "${CLIENT_FINGERPRINT}" '
+          .outbounds += [{
+            tag: $tag, protocol: "vless",
+            settings: {vnext: [{address: "127.0.0.1", port: 10443,
+              users: [{id: $uuid, encryption: "none"}]}]},
+            streamSettings: {network: "xhttp", security: "tls",
+              tlsSettings: {serverName: "xhttp.example.net", fingerprint: $fingerprint, alpn: ["h2"]},
+              xhttpSettings: {host: "xhttp.example.net", path: "/api/v1/test/", mode: "auto"}}
+          }]
+        ' "${config}" >"${tmp}"
+        mv -f "${tmp}" "${config}"
+        index=$((index + 1))
     fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        jq --arg uuid "${test_uuid}" --arg pin "${HYSTERIA_CERT_SHA256}" \
-          --arg fingerprint "${CLIENT_FINGERPRINT}" --arg hysteria_tag "${hysteria_tag}" '
-          .outbounds = ([{
-            tag: $hysteria_tag,
-            protocol: "hysteria",
-            settings: {address: "127.0.0.1", port: 443, version: 2},
-            streamSettings: {
-              network: "hysteria",
-              security: "tls",
-              tlsSettings: {
-                serverName: "xhttp.test",
-                fingerprint: $fingerprint,
-                alpn: ["h3"],
-                pinnedPeerCertSha256: $pin
-              },
-              hysteriaSettings: {version: 2, auth: $uuid}
-            }
-          }] + .outbounds)
-        ' "${injected}" >"${injected}.tmp"
-        mv -f "${injected}.tmp" "${injected}"
+        if ((index == 1)); then tag='proxy'; else tag="proxy-${index}"; fi
+        jq --arg tag "${tag}" --arg uuid "${test_uuid}" --arg pin "${HYSTERIA_CERT_SHA256}" \
+            --arg fingerprint "${CLIENT_FINGERPRINT}" '
+          .outbounds += [{
+            tag: $tag, protocol: "hysteria", settings: {address: "127.0.0.1", port: 443, version: 2},
+            streamSettings: {network: "hysteria", security: "tls",
+              tlsSettings: {serverName: "reality.example.com", fingerprint: $fingerprint,
+                alpn: ["h3"], pinnedPeerCertSha256: $pin},
+              hysteriaSettings: {version: 2, auth: $uuid}}
+          }]
+        ' "${config}" >"${tmp}"
+        mv -f "${tmp}" "${config}"
     fi
     docker run --rm --pull never --network none --cap-drop ALL --read-only \
-        -v "${injected}:/etc/xray/config.json:ro" \
-        --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" \
+        -v "${config}:/etc/xray/config.json:ro" --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" \
         run -test -config /etc/xray/config.json >/dev/null
-    jq --slurpfile fm "${INSTALL_DIR}/finalmask-fragment-canary.json" \
-        '(.outbounds[] | select(.protocol == "vless" and .streamSettings.network == "raw") |
-          .streamSettings.finalmask) = $fm[0]' \
-        "${injected}" >"${finalmask}"
-    docker run --rm --pull never --network none --cap-drop ALL --read-only \
-        -v "${finalmask}:/etc/xray/config.json:ro" \
-        --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" \
-        run -test -config /etc/xray/config.json >/dev/null
-    rm -rf -- "${temp_dir}"
+    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
+        jq --slurpfile fm "${INSTALL_DIR}/finalmask-fragment-canary.json" '
+          (.outbounds[] | select(.streamSettings.network == "raw") | .streamSettings.finalmask) = $fm[0]
+        ' "${config}" >"${tmp}"
+        docker run --rm --pull never --network none --cap-drop ALL --read-only \
+            -v "${tmp}:/etc/xray/config.json:ro" --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" \
+            run -test -config /etc/xray/config.json >/dev/null
+    fi
+    unset -f append_reality_test
+    find "${temp_dir}" -depth -delete
 }
 
 validate_artifacts() {
-    local caddy_output caddy_json
+    local caddy_output caddy_json expected_inbounds=0 expected_hosts=0
+    local -a caddy_subjects=("${REALITY_SNI}")
     log 'Validating strict JSON, pinned Xray, Compose, HAProxy and Caddy...'
     jq empty "${PRIVATE_DIR}/config-profile.ready.json"
     jq empty "${PRIVATE_DIR}/xray-json-auto.template.json"
@@ -1700,26 +2008,72 @@ validate_artifacts() {
     [[ ! -f "${PRIVATE_DIR}/xray-json-auto.ready.json" ]] || \
         jq empty "${PRIVATE_DIR}/xray-json-auto.ready.json"
 
-    jq -e --arg raw "${RAW_TAG}" --arg xhttp "${XHTTP_TAG}" \
-      --arg path "${XHTTP_PATH}" '
-      ([.inbounds[] | select(.tag == $raw)] | length == 1) and
-      ([.inbounds[] | select(.tag == $xhttp)] | length == 1) and
-      (.inbounds[] | select(.tag == $raw) |
-        .listen == "127.0.0.1" and .streamSettings.network == "raw" and
-        .streamSettings.security == "reality" and
-        (.settings | has("flow") | not)) and
-      (.inbounds[] | select(.tag == $xhttp) |
-        .listen == "127.0.0.1" and .streamSettings.network == "xhttp" and
-        .streamSettings.security == "none" and
-        .streamSettings.xhttpSettings.mode == "packet-up" and
-        .streamSettings.xhttpSettings.path == $path and
-        (.settings | has("flow") | not)) and
+    ((expected_inbounds += ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA))
+    ((expected_hosts += ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA))
+    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || ((expected_hosts += 1))
+    jq -e --argjson expected "${expected_inbounds}" '
+      (.inbounds | length == $expected) and
+      (all(.inbounds[]; (.settings | has("flow") | not))) and
       (all(.inbounds[]; (.streamSettings | has("finalmask") | not)))
     ' "${PRIVATE_DIR}/config-profile.ready.json" >/dev/null || \
-        die 'Server profile lost its loopback/no-manual-flow/no-server-FinalMask contract.'
+        die 'Server profile has an unexpected inbound count, manual flow, or server FinalMask.'
 
-    jq -e '
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        jq -e --arg tag "${RAW_TAG}" --arg sni "${REALITY_SNI}" \
+          --arg target "127.0.0.1:${CADDY_BACKEND_PORT}" '
+          [.inbounds[] | select(
+            .tag == $tag and .listen == "127.0.0.1" and
+            .streamSettings.network == "raw" and .streamSettings.security == "reality" and
+            .streamSettings.sockopt.acceptProxyProtocol == true and
+            .streamSettings.realitySettings.target == $target and
+            .streamSettings.realitySettings.serverNames == [$sni]
+          )] | length == 1
+        ' "${PRIVATE_DIR}/config-profile.ready.json" >/dev/null || \
+            die 'Self-SNI REALITY inbound lost its loopback, target, SNI, or PROXY contract.'
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        jq -e --arg tag "${EXTERNAL_REALITY_TAG}" --arg sni "${EXTERNAL_REALITY_SNI}" \
+          --arg target "${EXTERNAL_REALITY_TARGET}" '
+          [.inbounds[] | select(
+            .tag == $tag and .listen == "127.0.0.1" and
+            .streamSettings.network == "raw" and .streamSettings.security == "reality" and
+            .streamSettings.sockopt.acceptProxyProtocol == true and
+            .streamSettings.realitySettings.target == $target and
+            .streamSettings.realitySettings.serverNames == [$sni] and
+            .streamSettings.realitySettings.limitFallbackUpload.bytesPerSec == 1048576 and
+            .streamSettings.realitySettings.limitFallbackDownload.bytesPerSec == 1048576
+          )] | length == 1
+        ' "${PRIVATE_DIR}/config-profile.ready.json" >/dev/null || \
+            die 'External-target REALITY inbound lost its loopback, target, SNI, or PROXY contract.'
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        jq -e --arg tag "${XHTTP_TAG}" --arg path "${XHTTP_PATH}" '
+          [.inbounds[] | select(
+            .tag == $tag and .listen == "127.0.0.1" and
+            .streamSettings.network == "xhttp" and .streamSettings.security == "none" and
+            .streamSettings.xhttpSettings.mode == "auto" and
+            .streamSettings.xhttpSettings.path == $path
+          )] | length == 1
+        ' "${PRIVATE_DIR}/config-profile.ready.json" >/dev/null || \
+            die 'XHTTP inbound lost its loopback, auto-mode, or exact trailing-slash path contract.'
+        caddy_subjects+=("${XHTTP_SNI}")
+    fi
+    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
+        jq -e --arg tag "${HYSTERIA_TAG}" --argjson port 443 \
+          --arg masq "http://127.0.0.1:${HYSTERIA_MASQ_PORT}" '
+          [.inbounds[] | select(
+            .tag == $tag and .listen == "0.0.0.0" and .port == $port and
+            .protocol == "hysteria" and .settings.version == 2 and
+            .streamSettings.security == "tls" and
+            .streamSettings.hysteriaSettings.masquerade.url == $masq
+          )] | length == 1
+        ' "${PRIVATE_DIR}/config-profile.ready.json" >/dev/null || \
+            die 'Hysteria2 inbound lost its UDP/443 or loopback masquerade contract.'
+    fi
+
+    jq -e --argjson expected "${expected_hosts}" '
       .remnawave.injectHosts[0].selectFrom == "HIDDEN" and
+      (.remnawave.injectHosts[0].selector.values | length == $expected) and
       .routing.balancers[0].strategy.type == "leastPing" and
       (.dns.servers | length == 3) and
       (.dns.servers[0].address | startswith("https://")) and
@@ -1766,15 +2120,15 @@ validate_artifacts() {
         -v "${INSTALL_DIR}/Caddyfile:/etc/caddy/Caddyfile:ro" \
         -v "${INSTALL_DIR}/site:/srv:ro" \
         "${CADDY_IMAGE}" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null)"
-    jq -e --arg reality "${REALITY_SNI}" --arg xhttp "${XHTTP_SNI}" '
+    jq -e --argjson subjects "$(printf '%s\n' "${caddy_subjects[@]}" | jq -R . | jq -s .)" '
       ([.apps.tls.automation.policies[].issuers[] |
         select(.module == "acme" and .challenges.http.disabled == true and
         .challenges."tls-alpn".alternate_port == 19443)] | length == 1) and
-      ((.apps.tls.automation.policies[0].subjects | sort) == ([$reality, $xhttp] | sort)) and
+      (([.apps.tls.automation.policies[].subjects[]] | unique | sort) == ($subjects | unique | sort)) and
       ([.apps.http.servers[].listen[]] | index("127.0.0.1:19443") != null) and
       ([.apps.http.servers[].listen[]] | index("0.0.0.0:19443") == null)
     ' <<<"${caddy_json}" >/dev/null || \
-        die 'Caddy lost its two-subject TLS-ALPN or loopback-only listener contract.'
+        die 'Caddy lost its selected-subject TLS-ALPN or loopback-only listener contract.'
     log 'Artifact validation passed.'
 }
 
@@ -1823,7 +2177,7 @@ check_dns() {
     fi
     log 'Checking authoritative DNS and two independent recursive resolvers...'
     check_one_domain_dns "${REALITY_SNI}"
-    check_one_domain_dns "${XHTTP_SNI}"
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then check_one_domain_dns "${XHTTP_SNI}"; fi
     log 'DNS checks passed.'
 }
 
@@ -2053,7 +2407,8 @@ apply_firewall() {
         END {exit !found}
     ' || die 'The exact Panel-IP UFW allow rule was not observed after insertion.'
 
-    for backend in "${RAW_BACKEND_PORT}" "${XHTTP_BACKEND_PORT}" "${CADDY_BACKEND_PORT}" \
+    for backend in "${RAW_BACKEND_PORT}" "${EXTERNAL_REALITY_BACKEND_PORT}" \
+        "${XHTTP_BACKEND_PORT}" "${CADDY_BACKEND_PORT}" \
         "${HYSTERIA_MASQ_PORT}" "${HAPROXY_STATS_PORT}"; do
         if ufw status | awk -v p="${backend}" '($1 == p || $1 == p"/tcp") && $2 == "ALLOW" {found=1} END {exit !found}'; then
             die "UFW has an external allow for loopback backend port ${backend}; remove that rule."
@@ -2071,24 +2426,61 @@ apply_firewall() {
 validate_loaded_state() {
     validate_fqdn "${REALITY_SNI}" || die 'Invalid REALITY_SNI in state.'
     validate_fqdn "${XHTTP_SNI}" || die 'Invalid XHTTP_SNI in state.'
-    [[ "${REALITY_SNI}" != "${XHTTP_SNI}" ]] || die 'The two domains must be different.'
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        [[ "${REALITY_SNI}" != "${XHTTP_SNI}" ]] || die 'Self/cover and XHTTP domains must be different.'
+    fi
     validate_ipv4 "${EDGE_IPV4}" || die 'Invalid EDGE_IPV4 in state.'
     validate_ipv4 "${PANEL_IPV4}" || die 'Invalid PANEL_IPV4 in state.'
     validate_port "${NODE_PORT}" || die 'Invalid NODE_PORT in state.'
     case "${NODE_PORT}" in
-        443|"${RAW_BACKEND_PORT}"|"${XHTTP_BACKEND_PORT}"|"${CADDY_BACKEND_PORT}"|\
+        443|"${RAW_BACKEND_PORT}"|"${XHTTP_BACKEND_PORT}"|"${EXTERNAL_REALITY_BACKEND_PORT}"|\
+        "${CADDY_BACKEND_PORT}"|\
         "${HYSTERIA_MASQ_PORT}"|"${HAPROXY_STATS_PORT}"|"${RAW_TEST_PORT}"|\
-        "${RAW_FRAGMENT_TEST_PORT}"|"${XHTTP_TEST_PORT}"|"${HYSTERIA_TEST_PORT}")
+        "${RAW_FRAGMENT_TEST_PORT}"|"${XHTTP_TEST_PORT}"|"${HYSTERIA_TEST_PORT}"|\
+        "${EXTERNAL_REALITY_TEST_PORT}")
             die 'NODE_PORT in state conflicts with an edge or verification listener.' ;;
     esac
     [[ "${ACME_EMAIL}" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || \
         die 'Invalid ACME_EMAIL in state.'
     [[ "${NODE_SLUG}" =~ ^[a-z0-9][a-z0-9-]{1,31}$ ]] || die 'Invalid NODE_SLUG in state.'
-    [[ "${XHTTP_PATH}" =~ ^/api/v1/[0-9a-f]{48}/$ ]] || die 'Invalid XHTTP_PATH in state.'
-    [[ "${REALITY_SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] || die 'Invalid REALITY_SHORT_ID in state.'
-    [[ -n "${REALITY_PRIVATE_KEY}" && -n "${REALITY_PUBLIC_KEY}" ]] || die 'Missing REALITY material in state.'
+    [[ "${ENABLE_SELF_REALITY}" =~ ^[01]$ ]] || die 'Invalid ENABLE_SELF_REALITY in state.'
+    [[ "${ENABLE_EXTERNAL_REALITY}" =~ ^[01]$ ]] || die 'Invalid ENABLE_EXTERNAL_REALITY in state.'
+    [[ "${ENABLE_XHTTP}" =~ ^[01]$ ]] || die 'Invalid ENABLE_XHTTP in state.'
     [[ "${ENABLE_HYSTERIA}" =~ ^[01]$ ]] || die 'Invalid ENABLE_HYSTERIA in state.'
+    ((ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA > 0)) || \
+        die 'No transport is enabled in state.'
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        [[ "${REALITY_SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] || die 'Invalid REALITY_SHORT_ID in state.'
+        [[ -n "${REALITY_PRIVATE_KEY}" && -n "${REALITY_PUBLIC_KEY}" ]] || \
+            die 'Missing self-SNI REALITY material in state.'
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        validate_external_target_format "${EXTERNAL_REALITY_TARGET}" || \
+            die 'Invalid EXTERNAL_REALITY_TARGET in state.'
+        validate_fqdn "${EXTERNAL_REALITY_SNI}" || die 'Invalid EXTERNAL_REALITY_SNI in state.'
+        [[ "${EXTERNAL_REALITY_TARGET%:*}" == "${EXTERNAL_REALITY_SNI}" ]] || \
+            die 'External REALITY target hostname and SNI must match in this wizard.'
+        [[ "${EXTERNAL_REALITY_SNI}" != "${REALITY_SNI}" ]] || \
+            die 'External REALITY SNI must differ from the owned cover/self-SNI domain.'
+        [[ "${ENABLE_XHTTP}" != 1 || "${EXTERNAL_REALITY_SNI}" != "${XHTTP_SNI}" ]] || \
+            die 'External REALITY SNI must differ from the XHTTP domain.'
+        [[ "${EXTERNAL_REALITY_SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] || \
+            die 'Invalid external REALITY shortId in state.'
+        [[ -n "${EXTERNAL_REALITY_PRIVATE_KEY}" && -n "${EXTERNAL_REALITY_PUBLIC_KEY}" ]] || \
+            die 'Missing external REALITY material in state.'
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        [[ "${XHTTP_PATH}" =~ ^/api/v1/[0-9a-f]{48}/$ ]] || die 'Invalid XHTTP_PATH in state.'
+    fi
     [[ "${ENABLE_RAW_FRAGMENT}" =~ ^[01]$ ]] || die 'Invalid ENABLE_RAW_FRAGMENT in state.'
+    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
+        [[ "${FRAGMENT_REALITY}" == self || "${FRAGMENT_REALITY}" == external ]] || \
+            die 'FRAGMENT_REALITY must be self or external.'
+        [[ "${FRAGMENT_REALITY}" != self || "${ENABLE_SELF_REALITY}" == 1 ]] || \
+            die 'Fragment Host selects disabled self-SNI REALITY.'
+        [[ "${FRAGMENT_REALITY}" != external || "${ENABLE_EXTERNAL_REALITY}" == 1 ]] || \
+            die 'Fragment Host selects disabled external REALITY.'
+    fi
     [[ "${BLOCK_CLIENT_QUIC}" =~ ^[01]$ ]] || die 'Invalid BLOCK_CLIENT_QUIC in state.'
     [[ "${APPLY_TUNING}" =~ ^[01]$ ]] || die 'Invalid APPLY_TUNING in state.'
     validate_fingerprint "${CLIENT_FINGERPRINT}" || die 'Invalid CLIENT_FINGERPRINT in state.'
@@ -2099,10 +2491,15 @@ validate_loaded_state() {
 }
 
 show_configuration_summary() {
-    local transports='RAW/REALITY + TLS/XHTTP'
+    local transports=''
     local fragment_status='disabled' quic_status='disabled' tuning_status='disabled'
-    [[ "${ENABLE_HYSTERIA}" != 1 ]] || transports+=' + Hysteria2'
-    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || fragment_status='enabled'
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || transports='RAW/REALITY self-SNI'
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        transports+="${transports:+ + }RAW/REALITY external"
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then transports+="${transports:+ + }TLS/XHTTP"; fi
+    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then transports+="${transports:+ + }Hysteria2"; fi
+    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || fragment_status="enabled on ${FRAGMENT_REALITY} REALITY"
     [[ "${BLOCK_CLIENT_QUIC}" != 1 ]] || quic_status='enabled'
     [[ "${APPLY_TUNING}" != 1 ]] || tuning_status='enabled'
     ui_section 'Configuration summary' 'safe values only; generated keys and paths stay hidden'
@@ -2111,8 +2508,10 @@ show_configuration_summary() {
     ui_kv 'Edge IPv4' "${EDGE_IPV4}"
     ui_kv 'Panel egress IPv4' "${PANEL_IPV4}"
     ui_kv 'Node API' "${NODE_PORT}/tcp (Panel allowlist only)"
-    ui_kv 'REALITY SNI' "${REALITY_SNI}"
-    ui_kv 'XHTTP / cover SNI' "${XHTTP_SNI}"
+    ui_kv 'Owned cover domain' "${REALITY_SNI}"
+    [[ "${ENABLE_XHTTP}" != 1 ]] || ui_kv 'XHTTP domain' "${XHTTP_SNI}"
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
+        ui_kv 'External REALITY' "${EXTERNAL_REALITY_TARGET} (measured target)"
     ui_kv 'Transports' "${transports}"
     ui_kv 'Client fingerprint' "${CLIENT_FINGERPRINT}"
     ui_kv 'Fragment A/B Host' "${fragment_status}"
@@ -2131,6 +2530,10 @@ init_stage() {
         load_state
         validate_loaded_state
         pull_images
+        if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+            probe_external_reality_target "${EXTERNAL_REALITY_TARGET}" "${EXTERNAL_REALITY_SNI}" || \
+                die 'Saved external REALITY target no longer passes DNS/TLS/Xray validation.'
+        fi
         render_validate_transaction
         log "Existing protected state and every generated artifact were rebuilt and validated."
         return 0
@@ -2144,13 +2547,47 @@ init_stage() {
     ACME_EMAIL="${RW_ACME_EMAIL:-}"
     NODE_PORT="${RW_NODE_PORT:-}"
     NODE_SLUG="${RW_NODE_NAME:-}"
+    ENABLE_SELF_REALITY="${RW_ENABLE_SELF_REALITY:-}"
+    ENABLE_EXTERNAL_REALITY="${RW_ENABLE_EXTERNAL_REALITY:-}"
+    ENABLE_XHTTP="${RW_ENABLE_XHTTP:-}"
     ENABLE_HYSTERIA="${RW_ENABLE_HYSTERIA:-}"
     ENABLE_RAW_FRAGMENT="${RW_ENABLE_RAW_FRAGMENT:-}"
+    FRAGMENT_REALITY="${RW_FRAGMENT_REALITY:-}"
     BLOCK_CLIENT_QUIC="${RW_BLOCK_CLIENT_QUIC:-}"
     APPLY_TUNING="${RW_APPLY_TUNING:-}"
     CLIENT_FINGERPRINT="${RW_CLIENT_FINGERPRINT:-firefox}"
-    prompt_value REALITY_SNI 'Self-SNI domain for RAW REALITY'
-    prompt_value XHTTP_SNI 'Second domain for TLS/XHTTP'
+    ui_section 'Transport selection' 'each enabled transport gets its own inbound and physical Host'
+    prompt_yes_no ENABLE_SELF_REALITY 'Enable RAW/TCP + REALITY self-SNI?' 1
+    prompt_yes_no ENABLE_EXTERNAL_REALITY 'Enable RAW/TCP + REALITY on a measured external domain?' 1
+    prompt_yes_no ENABLE_XHTTP 'Enable VLESS XHTTP auto behind ordinary TLS/HTTP2?' 1
+    prompt_yes_no ENABLE_HYSTERIA 'Enable Hysteria2 on UDP/443?' 1
+    [[ "${ENABLE_SELF_REALITY}" =~ ^[01]$ && "${ENABLE_EXTERNAL_REALITY}" =~ ^[01]$ && \
+       "${ENABLE_XHTTP}" =~ ^[01]$ && "${ENABLE_HYSTERIA}" =~ ^[01]$ ]] || \
+        die 'Transport selections must be 0 or 1.'
+    ((ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA > 0)) || \
+        die 'Select at least one transport.'
+    if [[ "${ENABLE_SELF_REALITY}" == 1 || "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        prompt_yes_no ENABLE_RAW_FRAGMENT 'Generate one isolated client-fragment A/B Host?' 1
+    else
+        ENABLE_RAW_FRAGMENT=0
+    fi
+    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
+        if [[ "${ENABLE_SELF_REALITY}" == 1 && "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+            prompt_value FRAGMENT_REALITY 'Fragment Host base (self/external)' 'external'
+        elif [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+            FRAGMENT_REALITY='external'
+        else
+            FRAGMENT_REALITY='self'
+        fi
+    else
+        FRAGMENT_REALITY='self'
+    fi
+    prompt_value REALITY_SNI 'Owned cover/self-SNI domain'
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        prompt_value XHTTP_SNI 'Second owned domain for TLS/XHTTP'
+    else
+        XHTTP_SNI="${REALITY_SNI}"
+    fi
     prompt_value EDGE_IPV4 'Public IPv4 of this Node' "${detected_ip}"
     prompt_value PANEL_IPV4 'Observed public/NAT egress IPv4 of Remnawave Panel'
     prompt_value ACME_EMAIL 'Email for ACME certificate notices'
@@ -2159,10 +2596,6 @@ init_stage() {
         tr -cd 'a-z0-9-' | cut -c1-24)"
     default_node_name="${default_node_name:-edge-node}"
     prompt_value NODE_SLUG 'Short Node name (for example jade-noda)' "${default_node_name}"
-    prompt_yes_no ENABLE_HYSTERIA \
-        'Enable Hysteria2 on UDP/443 as the third transport?' 1
-    prompt_yes_no ENABLE_RAW_FRAGMENT \
-        'Generate a separate RAW client-fragment A/B Host?' 1
     prompt_yes_no BLOCK_CLIENT_QUIC \
         'Block inner client QUIC/UDP443 for the stable RU profile?' 1
     prompt_yes_no APPLY_TUNING \
@@ -2172,12 +2605,17 @@ init_stage() {
     CLIENT_FINGERPRINT="${CLIENT_FINGERPRINT,,}"
     validate_fqdn "${REALITY_SNI}" || die "Invalid domain: ${REALITY_SNI}"
     validate_fqdn "${XHTTP_SNI}" || die "Invalid domain: ${XHTTP_SNI}"
-    [[ "${REALITY_SNI}" != "${XHTTP_SNI}" ]] || die 'Use two distinct domain names.'
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        [[ "${REALITY_SNI}" != "${XHTTP_SNI}" ]] || die 'Use two distinct owned domain names when XHTTP is enabled.'
+    fi
     validate_ipv4 "${EDGE_IPV4}" || die "Invalid edge IPv4: ${EDGE_IPV4}"
     validate_ipv4 "${PANEL_IPV4}" || die "Invalid Panel IPv4: ${PANEL_IPV4}"
     validate_port "${NODE_PORT}" || die "Invalid Node port: ${NODE_PORT}"
     [[ "${NODE_SLUG}" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{1,31}$ ]] || \
         die 'Node name must be 2-32 ASCII letters, digits or hyphens.'
+    [[ "${ENABLE_SELF_REALITY}" =~ ^[01]$ ]] || die 'RW_ENABLE_SELF_REALITY must be 0 or 1.'
+    [[ "${ENABLE_EXTERNAL_REALITY}" =~ ^[01]$ ]] || die 'RW_ENABLE_EXTERNAL_REALITY must be 0 or 1.'
+    [[ "${ENABLE_XHTTP}" =~ ^[01]$ ]] || die 'RW_ENABLE_XHTTP must be 0 or 1.'
     [[ "${ENABLE_HYSTERIA}" =~ ^[01]$ ]] || die 'RW_ENABLE_HYSTERIA must be 0 or 1.'
     [[ "${ENABLE_RAW_FRAGMENT}" =~ ^[01]$ ]] || die 'RW_ENABLE_RAW_FRAGMENT must be 0 or 1.'
     [[ "${BLOCK_CLIENT_QUIC}" =~ ^[01]$ ]] || die 'RW_BLOCK_CLIENT_QUIC must be 0 or 1.'
@@ -2185,9 +2623,11 @@ init_stage() {
     validate_fingerprint "${CLIENT_FINGERPRINT}" || die 'Invalid RW_CLIENT_FINGERPRINT characters.'
     [[ "${ACME_EMAIL}" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'Invalid ACME email.'
     case "${NODE_PORT}" in
-        443|"${RAW_BACKEND_PORT}"|"${XHTTP_BACKEND_PORT}"|"${CADDY_BACKEND_PORT}"|\
+        443|"${RAW_BACKEND_PORT}"|"${XHTTP_BACKEND_PORT}"|"${EXTERNAL_REALITY_BACKEND_PORT}"|\
+        "${CADDY_BACKEND_PORT}"|\
         "${HYSTERIA_MASQ_PORT}"|"${HAPROXY_STATS_PORT}"|"${RAW_TEST_PORT}"|\
-        "${RAW_FRAGMENT_TEST_PORT}"|"${XHTTP_TEST_PORT}"|"${HYSTERIA_TEST_PORT}")
+        "${RAW_FRAGMENT_TEST_PORT}"|"${XHTTP_TEST_PORT}"|"${HYSTERIA_TEST_PORT}"|\
+        "${EXTERNAL_REALITY_TEST_PORT}")
             die "Node port ${NODE_PORT} conflicts with the edge." ;;
     esac
 
@@ -2195,17 +2635,25 @@ init_stage() {
     NODE_CODE="$(printf '%s' "${NODE_SLUG}" | tr '[:lower:]-' '[:upper:]_')"
     NODE_CODE_LOWER="${NODE_SLUG}"
     PROFILE_NAME="RW-EDGE-${NODE_CODE}"
-    RAW_TAG="RW_${NODE_CODE}_RAW_REALITY"
+    RAW_TAG="RW_${NODE_CODE}_RAW_REALITY_SELF"
     XHTTP_TAG="RW_${NODE_CODE}_XHTTP_TLS"
+    EXTERNAL_REALITY_TAG="RW_${NODE_CODE}_RAW_REALITY_EXTERNAL"
     HYSTERIA_TAG="RW_${NODE_CODE}_HYSTERIA2"
     NODE_CONTAINER="rw-edge-node-${NODE_CODE_LOWER}"
     HAPROXY_CONTAINER="rw-edge-haproxy-${NODE_CODE_LOWER}"
     CADDY_CONTAINER="rw-edge-caddy-${NODE_CODE_LOWER}"
     COMPOSE_PROJECT="rw-edge-${NODE_CODE_LOWER}"
 
-    show_configuration_summary
     install -d -m 0700 "${PRIVATE_DIR}"
     pull_images
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        select_external_reality_target
+        [[ "${EXTERNAL_REALITY_SNI}" != "${REALITY_SNI}" ]] || \
+            die 'External REALITY SNI must differ from the owned cover/self-SNI domain.'
+        [[ "${ENABLE_XHTTP}" != 1 || "${EXTERNAL_REALITY_SNI}" != "${XHTTP_SNI}" ]] || \
+            die 'External REALITY SNI must differ from the XHTTP domain.'
+    fi
+    show_configuration_summary
     generate_material
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then generate_hysteria_certificate; fi
     render_validate_transaction
@@ -2266,13 +2714,17 @@ panel_session_present() {
 }
 
 wait_for_node_ready() {
-    local attempt
+    local attempt ready
     for attempt in $(seq 1 90); do
-        if port_is_listening "${NODE_PORT}" && \
-           port_is_listening "${RAW_BACKEND_PORT}" && \
-           port_is_listening "${XHTTP_BACKEND_PORT}" && \
-           { [[ "${ENABLE_HYSTERIA}" != 1 ]] || udp_port_is_listening 443; } && \
-           panel_session_present; then
+        ready=1
+        port_is_listening "${NODE_PORT}" || ready=0
+        [[ "${ENABLE_SELF_REALITY}" != 1 ]] || port_is_listening "${RAW_BACKEND_PORT}" || ready=0
+        [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
+            port_is_listening "${EXTERNAL_REALITY_BACKEND_PORT}" || ready=0
+        [[ "${ENABLE_XHTTP}" != 1 ]] || port_is_listening "${XHTTP_BACKEND_PORT}" || ready=0
+        [[ "${ENABLE_HYSTERIA}" != 1 ]] || udp_port_is_listening 443 || ready=0
+        panel_session_present || ready=0
+        if [[ "${ready}" == 1 ]]; then
             log 'Node API, all selected Xray transports and an established Panel session are ready.'
             return 0
         fi
@@ -2388,8 +2840,12 @@ node_stage() {
     pull_images
     render_validate_transaction
     assert_port_free_or_owned "${NODE_PORT}" "${NODE_CONTAINER}"
-    assert_port_free_or_owned "${RAW_BACKEND_PORT}" "${NODE_CONTAINER}"
-    assert_port_free_or_owned "${XHTTP_BACKEND_PORT}" "${NODE_CONTAINER}"
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || \
+        assert_port_free_or_owned "${RAW_BACKEND_PORT}" "${NODE_CONTAINER}"
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
+        assert_port_free_or_owned "${EXTERNAL_REALITY_BACKEND_PORT}" "${NODE_CONTAINER}"
+    [[ "${ENABLE_XHTTP}" != 1 ]] || \
+        assert_port_free_or_owned "${XHTTP_BACKEND_PORT}" "${NODE_CONTAINER}"
     if [[ "${ENABLE_HYSTERIA}" == 1 ]] && udp_port_is_listening 443 && \
        ! container_is_running "${NODE_CONTAINER}"; then
         die 'UDP/443 is occupied by another service.'
@@ -2397,11 +2853,16 @@ node_stage() {
     container_is_running "${NODE_CONTAINER}" && node_was_running=1
     if [[ "${node_was_running}" == 1 ]]; then
         port_is_listening "${NODE_PORT}" || die 'Existing managed Node has no API listener.'
-        port_is_listening "${RAW_BACKEND_PORT}" || die 'Existing managed Node has no RAW listener.'
-        port_is_listening "${XHTTP_BACKEND_PORT}" || die 'Existing managed Node has no XHTTP listener.'
+        [[ "${ENABLE_SELF_REALITY}" != 1 ]] || port_is_listening "${RAW_BACKEND_PORT}" || \
+            die 'Existing managed Node has no self-SNI REALITY listener.'
+        [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
+            port_is_listening "${EXTERNAL_REALITY_BACKEND_PORT}" || \
+            die 'Existing managed Node has no external REALITY listener.'
+        [[ "${ENABLE_XHTTP}" != 1 ]] || port_is_listening "${XHTTP_BACKEND_PORT}" || \
+            die 'Existing managed Node has no XHTTP listener.'
         panel_session_present || die 'Existing managed Node has no established Panel session.'
         check_negative_mtls
-        check_runtime_path
+        [[ "${ENABLE_XHTTP}" != 1 ]] || check_runtime_path
         log 'Existing managed Node passed control-plane and runtime-contract checks; it was not recreated.'
         return 0
     fi
@@ -2419,60 +2880,49 @@ node_stage() {
 }
 
 template_stage() {
-    local uuid
-    local -a extra normalized_extra
-    local -A seen_extra=()
+    local uuid normalized name
+    local -a extra normalized_extra selected_values
+    local -A seen=()
     announce_stage template
     require_root
     load_state
     validate_loaded_state
     RAW_HOST_UUID="${RW_RAW_HOST_UUID:-${RAW_HOST_UUID:-}}"
+    EXTERNAL_REALITY_HOST_UUID="${RW_EXTERNAL_REALITY_HOST_UUID:-${EXTERNAL_REALITY_HOST_UUID:-}}"
     RAW_FRAGMENT_HOST_UUID="${RW_RAW_FRAGMENT_HOST_UUID:-${RAW_FRAGMENT_HOST_UUID:-}}"
     XHTTP_HOST_UUID="${RW_XHTTP_HOST_UUID:-${XHTTP_HOST_UUID:-}}"
     HYSTERIA_HOST_UUID="${RW_HYSTERIA_HOST_UUID:-${HYSTERIA_HOST_UUID:-}}"
     EXTRA_HOST_UUIDS="${RW_EXTRA_HOST_UUIDS:-${EXTRA_HOST_UUIDS:-}}"
-    prompt_value RAW_HOST_UUID 'RAW physical Host UUID'
-    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        prompt_value RAW_FRAGMENT_HOST_UUID 'RAW Fragment physical Host UUID'
-    fi
-    prompt_value XHTTP_HOST_UUID 'XHTTP physical Host UUID'
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        prompt_value HYSTERIA_HOST_UUID 'Hysteria2 physical Host UUID'
-    fi
-    validate_uuid "${RAW_HOST_UUID}" || die 'Invalid RAW Host UUID.'
-    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || validate_uuid "${RAW_FRAGMENT_HOST_UUID}" || \
-        die 'Invalid RAW Fragment Host UUID.'
-    validate_uuid "${XHTTP_HOST_UUID}" || die 'Invalid XHTTP Host UUID.'
-    [[ "${ENABLE_HYSTERIA}" != 1 ]] || validate_uuid "${HYSTERIA_HOST_UUID}" || \
-        die 'Invalid Hysteria2 Host UUID.'
-    RAW_HOST_UUID="${RAW_HOST_UUID,,}"
-    RAW_FRAGMENT_HOST_UUID="${RAW_FRAGMENT_HOST_UUID,,}"
-    XHTTP_HOST_UUID="${XHTTP_HOST_UUID,,}"
-    HYSTERIA_HOST_UUID="${HYSTERIA_HOST_UUID,,}"
-    [[ "${RAW_HOST_UUID}" != "${XHTTP_HOST_UUID}" ]] || die 'Physical Host UUIDs must be different.'
-    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        [[ "${RAW_FRAGMENT_HOST_UUID}" != "${RAW_HOST_UUID}" && \
-           "${RAW_FRAGMENT_HOST_UUID}" != "${XHTTP_HOST_UUID}" ]] || \
-            die 'RAW Fragment Host UUID duplicates another physical Host.'
-    fi
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        [[ "${HYSTERIA_HOST_UUID}" != "${RAW_HOST_UUID}" && \
-           "${HYSTERIA_HOST_UUID}" != "${RAW_FRAGMENT_HOST_UUID:-}" && \
-           "${HYSTERIA_HOST_UUID}" != "${XHTTP_HOST_UUID}" ]] || \
-            die 'Hysteria2 Host UUID duplicates another physical Host.'
-    fi
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || prompt_value RAW_HOST_UUID 'Self-SNI REALITY physical Host UUID'
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
+        prompt_value EXTERNAL_REALITY_HOST_UUID 'External REALITY physical Host UUID'
+    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || \
+        prompt_value RAW_FRAGMENT_HOST_UUID "${FRAGMENT_REALITY} REALITY Fragment physical Host UUID"
+    [[ "${ENABLE_XHTTP}" != 1 ]] || prompt_value XHTTP_HOST_UUID 'XHTTP physical Host UUID'
+    [[ "${ENABLE_HYSTERIA}" != 1 ]] || prompt_value HYSTERIA_HOST_UUID 'Hysteria2 physical Host UUID'
+
+    selected_values=()
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || selected_values+=("RAW_HOST_UUID")
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || selected_values+=("EXTERNAL_REALITY_HOST_UUID")
+    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || selected_values+=("RAW_FRAGMENT_HOST_UUID")
+    [[ "${ENABLE_XHTTP}" != 1 ]] || selected_values+=("XHTTP_HOST_UUID")
+    [[ "${ENABLE_HYSTERIA}" != 1 ]] || selected_values+=("HYSTERIA_HOST_UUID")
+    for name in "${selected_values[@]}"; do
+        uuid="${!name}"
+        validate_uuid "${uuid}" || die "Invalid selected physical Host UUID (${name})."
+        normalized="${uuid,,}"
+        [[ -z "${seen[${normalized}]:-}" ]] || die 'Selected physical Host UUIDs must be unique.'
+        seen["${normalized}"]=1
+        printf -v "${name}" '%s' "${normalized}"
+    done
     if [[ -n "${EXTRA_HOST_UUIDS}" ]]; then
         IFS=',' read -r -a extra <<<"${EXTRA_HOST_UUIDS}"
         for uuid in "${extra[@]}"; do
             uuid="${uuid//[[:space:]]/}"
             validate_uuid "${uuid}" || die "Invalid extra Host UUID: ${uuid}"
             uuid="${uuid,,}"
-            [[ "${uuid,,}" != "${RAW_HOST_UUID}" && "${uuid,,}" != "${XHTTP_HOST_UUID}" && \
-               "${uuid,,}" != "${RAW_FRAGMENT_HOST_UUID:-}" && \
-               "${uuid,,}" != "${HYSTERIA_HOST_UUID:-}" ]] || \
-                die 'Extra Host UUID duplicates one of this node physical Hosts.'
-            [[ -z "${seen_extra[${uuid}]:-}" ]] || die "Duplicate extra Host UUID: ${uuid}"
-            seen_extra["${uuid}"]=1
+            [[ -z "${seen[${uuid}]:-}" ]] || die "Duplicate Host UUID: ${uuid}"
+            seen["${uuid}"]=1
             normalized_extra+=("${uuid}")
         done
         EXTRA_HOST_UUIDS="$(IFS=,; printf '%s' "${normalized_extra[*]}")"
@@ -2480,15 +2930,14 @@ template_stage() {
     render_happ_rules
     render_auto_template
     render_panel_stage_two
+    [[ -s "${PRIVATE_DIR}/xray-json-auto.ready.json" ]] || die 'AUTO template was not rendered.'
     jq empty "${PRIVATE_DIR}/xray-json-auto.ready.json"
     validate_auto_template_model "${PRIVATE_DIR}/xray-json-auto.ready.json"
     write_state
     success 'XRAY_JSON AUTO template rendered and validated.'
     ui_file 'Ready template' "${PRIVATE_DIR}/xray-json-auto.ready.json"
     ui_file 'Exact Panel steps' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
-    if [[ "${SHOW_VALUES}" == 1 ]]; then
-        sed -n '1,240p' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
-    fi
+    if [[ "${SHOW_VALUES}" == 1 ]]; then sed -n '1,240p' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"; fi
 }
 
 wait_for_public_tls() {
@@ -2517,8 +2966,13 @@ edge_stage() {
     check_dns
     validate_artifacts
     container_is_running "${NODE_CONTAINER}" || die 'Managed Node is not running. Run the node stage first.'
-    port_is_listening "${RAW_BACKEND_PORT}" || die 'RAW backend is not listening.'
-    port_is_listening "${XHTTP_BACKEND_PORT}" || die 'XHTTP backend is not listening.'
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || port_is_listening "${RAW_BACKEND_PORT}" || \
+        die 'Self-SNI REALITY backend is not listening.'
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
+        port_is_listening "${EXTERNAL_REALITY_BACKEND_PORT}" || \
+        die 'External REALITY backend is not listening.'
+    [[ "${ENABLE_XHTTP}" != 1 ]] || port_is_listening "${XHTTP_BACKEND_PORT}" || \
+        die 'XHTTP backend is not listening.'
     panel_session_present || die 'No established Panel session to the Node API.'
     assert_port_free_or_owned 443 "${HAPROXY_CONTAINER}"
     assert_port_free_or_owned "${CADDY_BACKEND_PORT}" "${CADDY_CONTAINER}"
@@ -2555,10 +3009,12 @@ edge_stage() {
         docker logs --tail 80 "${CADDY_CONTAINER}" >&2 || true
         die "Trusted HTTPS did not become ready for ${REALITY_SNI}."
     }
-    wait_for_public_tls "${XHTTP_SNI}" || {
-        docker logs --tail 80 "${CADDY_CONTAINER}" >&2 || true
-        die "Trusted HTTPS did not become ready for ${XHTTP_SNI}."
-    }
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        wait_for_public_tls "${XHTTP_SNI}" || {
+            docker logs --tail 80 "${CADDY_CONTAINER}" >&2 || true
+            die "Trusted HTTPS did not become ready for ${XHTTP_SNI}."
+        }
+    fi
     verify_stage
     commit_stage
 }
@@ -2621,13 +3077,14 @@ check_runtime_path() (
     jq -e --arg tag "${XHTTP_TAG}" --arg path "${XHTTP_PATH}" '
       ([.inbounds[] | select(.tag == $tag) |
         {path: .streamSettings.xhttpSettings.path, mode: .streamSettings.xhttpSettings.mode}] |
-       unique) == [{path: $path, mode: "packet-up"}]
+       unique) == [{path: $path, mode: "auto"}]
     ' "${dump}" >/dev/null || \
-        die 'Live Node XHTTP path or packet-up mode differs from protected edge state.'
+        die 'Live Node XHTTP path or auto mode differs from protected edge state.'
 )
 
 verify_stage() {
     local exact_code decoy_code loopback_port
+    local -a loopback_ports=("${CADDY_BACKEND_PORT}" "${HYSTERIA_MASQ_PORT}" "${HAPROXY_STATS_PORT}")
     announce_stage verify
     require_root
     need_commands
@@ -2643,8 +3100,21 @@ verify_stage() {
     ' >/dev/null || die 'Managed Node unexpectedly has NET_ADMIN; fixed RemnaNode nft table names make that unsafe.'
     port_is_listening 443 || die 'Public TCP/443 is not listening.'
     port_is_listening "${NODE_PORT}" || die 'Node API is not listening.'
-    port_is_listening "${RAW_BACKEND_PORT}" || die 'RAW backend is not listening.'
-    port_is_listening "${XHTTP_BACKEND_PORT}" || die 'XHTTP backend is not listening.'
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        port_is_listening "${RAW_BACKEND_PORT}" || die 'Self-SNI REALITY backend is not listening.'
+        loopback_ports+=("${RAW_BACKEND_PORT}")
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        port_is_listening "${EXTERNAL_REALITY_BACKEND_PORT}" || \
+            die 'External-target REALITY backend is not listening.'
+        loopback_ports+=("${EXTERNAL_REALITY_BACKEND_PORT}")
+        probe_external_reality_target "${EXTERNAL_REALITY_TARGET}" "${EXTERNAL_REALITY_SNI}" || \
+            die 'The configured external REALITY target no longer passes DNS/TLS/Xray validation.'
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        port_is_listening "${XHTTP_BACKEND_PORT}" || die 'XHTTP backend is not listening.'
+        loopback_ports+=("${XHTTP_BACKEND_PORT}")
+    fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
         udp_port_is_listening 443 || die 'Hysteria2 UDP/443 is not listening.'
         udp_port_owned_by_container 443 "${NODE_CONTAINER}" || \
@@ -2655,72 +3125,109 @@ verify_stage() {
     port_is_listening "${CADDY_BACKEND_PORT}" || die 'Caddy loopback backend is not listening.'
     port_is_listening "${HYSTERIA_MASQ_PORT}" || die 'Caddy Hysteria masquerade origin is not listening.'
     port_is_listening "${HAPROXY_STATS_PORT}" || die 'HAProxy loopback stats is not listening.'
-    for loopback_port in "${RAW_BACKEND_PORT}" "${XHTTP_BACKEND_PORT}" "${CADDY_BACKEND_PORT}" \
-        "${HYSTERIA_MASQ_PORT}" "${HAPROXY_STATS_PORT}"; do
+    for loopback_port in "${loopback_ports[@]}"; do
         port_is_loopback_only "${loopback_port}" || die "Backend ${loopback_port} is not loopback-only."
     done
     [[ -z "$(ss -H -ltn 'sport = :80')" ]] || die 'TCP/80 unexpectedly listens; this design uses TLS-ALPN on TCP/443 only.'
     panel_session_present || die 'No established Panel session to Node API.'
     check_negative_mtls
     check_https_cover "${REALITY_SNI}"
-    check_https_cover "${XHTTP_SNI}"
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        check_https_cover "${XHTTP_SNI}"
+        exact_code="$(curl --silent --show-error --noproxy '*' --http2 \
+            --resolve "${XHTTP_SNI}:443:${EDGE_IPV4}" -o /dev/null -w '%{http_code}' \
+            "https://${XHTTP_SNI}${XHTTP_PATH}" 2>/dev/null || true)"
+        [[ "${exact_code}" =~ ^[234][0-9][0-9]$ && "${exact_code}" != 404 ]] || \
+            die 'Exact XHTTP route did not reach Xray.'
+        decoy_code="$(curl --silent --show-error --noproxy '*' --http2 \
+            --resolve "${XHTTP_SNI}:443:${EDGE_IPV4}" -o /dev/null -w '%{http_code}' \
+            "https://${XHTTP_SNI}/api/v1/not-the-transport/" 2>/dev/null || true)"
+        [[ "${decoy_code}" == 404 ]] || die "Decoy XHTTP route returned ${decoy_code}, expected 404."
+        check_runtime_path
+    fi
+    log 'PASS: DNS, mTLS control plane, all selected listeners, cover HTTPS and transport routing.'
+}
 
-    exact_code="$(curl --silent --show-error --noproxy '*' --http2 \
-        --resolve "${XHTTP_SNI}:443:${EDGE_IPV4}" -o /dev/null -w '%{http_code}' \
-        "https://${XHTTP_SNI}${XHTTP_PATH}" 2>/dev/null || true)"
-    [[ "${exact_code}" =~ ^[234][0-9][0-9]$ && "${exact_code}" != 404 ]] || \
-        die 'Exact XHTTP route did not reach Xray.'
-    decoy_code="$(curl --silent --show-error --noproxy '*' --http2 \
-        --resolve "${XHTTP_SNI}:443:${EDGE_IPV4}" -o /dev/null -w '%{http_code}' \
-        "https://${XHTTP_SNI}/api/v1/not-the-transport/" 2>/dev/null || true)"
-    [[ "${decoy_code}" == 404 ]] || die "Decoy XHTTP route returned ${decoy_code}, expected 404."
-    check_runtime_path
-    log 'PASS: DNS, mTLS control plane, selected listeners, trusted HTTP/2 covers and XHTTP routing.'
+render_reality_auth_client() {
+    local runtime="$1" tag="$2" server_name="$3" public_key="$4" socks_port="$5" output="$6"
+    local user_id short_id
+    user_id="$(jq -r --arg tag "${tag}" \
+        '.inbounds[] | select(.tag == $tag) | .settings.clients[0].id // empty' "${runtime}")"
+    short_id="$(jq -r --arg tag "${tag}" \
+        '.inbounds[] | select(.tag == $tag) | .streamSettings.realitySettings.shortIds[0] // empty' "${runtime}")"
+    validate_uuid "${user_id}" || die "No active user credential was injected into ${tag}."
+    [[ "${short_id}" =~ ^[0-9a-fA-F]{16}$ ]] || die "Live REALITY shortId is invalid for ${tag}."
+    jq -n --arg address "${EDGE_IPV4}" --arg id "${user_id}" \
+        --arg server_name "${server_name}" --arg public_key "${public_key}" \
+        --arg short_id "${short_id}" --arg fingerprint "${CLIENT_FINGERPRINT}" \
+        --argjson socks_port "${socks_port}" '
+      {
+        log: {loglevel: "warning"},
+        inbounds: [{
+          tag: "socks-in", listen: "127.0.0.1", port: $socks_port,
+          protocol: "socks", settings: {auth: "noauth", udp: true}
+        }],
+        outbounds: [{
+          tag: "proxy", protocol: "vless",
+          settings: {vnext: [{
+            address: $address, port: 443,
+            users: [{id: $id, encryption: "none", flow: "xtls-rprx-vision"}]
+          }]},
+          streamSettings: {
+            network: "raw", security: "reality",
+            realitySettings: {
+              serverName: $server_name, fingerprint: $fingerprint,
+              publicKey: $public_key, shortId: $short_id, spiderX: "/"
+            }
+          }
+        }]
+      }
+    ' >"${output}"
+    chmod 0600 "${output}"
 }
 
 render_auth_clients() {
-    local runtime="$1" raw_config="$2" xhttp_config="$3" hysteria_config="$4"
-    local raw_id xhttp_id hysteria_auth short_id
-    raw_id="$(jq -r --arg tag "${RAW_TAG}" '.inbounds[] | select(.tag == $tag) | .settings.clients[0].id // empty' "${runtime}")"
-    xhttp_id="$(jq -r --arg tag "${XHTTP_TAG}" '.inbounds[] | select(.tag == $tag) | .settings.clients[0].id // empty' "${runtime}")"
-    short_id="$(jq -r --arg tag "${RAW_TAG}" '.inbounds[] | select(.tag == $tag) | .streamSettings.realitySettings.shortIds[0] // empty' "${runtime}")"
-    validate_uuid "${raw_id}" || die 'No active user credential was injected into RAW inbound.'
-    validate_uuid "${xhttp_id}" || die 'No active user credential was injected into XHTTP inbound.'
-    [[ "${short_id}" =~ ^[0-9a-fA-F]{16}$ ]] || die 'Live REALITY shortId is invalid.'
-
-    jq -n --arg address "${EDGE_IPV4}" --arg id "${raw_id}" \
-        --arg server_name "${REALITY_SNI}" --arg public_key "${REALITY_PUBLIC_KEY}" \
-        --arg short_id "${short_id}" --arg fingerprint "${CLIENT_FINGERPRINT}" \
-        --argjson socks_port "${RAW_TEST_PORT}" '
-      {
-        log: {loglevel: "warning"},
-        inbounds: [{tag: "socks-in", listen: "127.0.0.1", port: $socks_port, protocol: "socks", settings: {auth: "noauth", udp: true}}],
-        outbounds: [{
-          tag: "proxy", protocol: "vless",
-          settings: {vnext: [{address: $address, port: 443, users: [{id: $id, encryption: "none", flow: "xtls-rprx-vision"}]}]},
-          streamSettings: {network: "raw", security: "reality", realitySettings: {serverName: $server_name, fingerprint: $fingerprint, publicKey: $public_key, shortId: $short_id, spiderX: "/"}}
-        }]
-      }
-    ' >"${raw_config}"
-
-    jq -n --arg address "${EDGE_IPV4}" --arg id "${xhttp_id}" \
-        --arg server_name "${XHTTP_SNI}" --arg path "${XHTTP_PATH}" \
-        --arg fingerprint "${CLIENT_FINGERPRINT}" \
-        --argjson socks_port "${XHTTP_TEST_PORT}" '
-      {
-        log: {loglevel: "warning"},
-        inbounds: [{tag: "socks-in", listen: "127.0.0.1", port: $socks_port, protocol: "socks", settings: {auth: "noauth", udp: true}}],
-        outbounds: [{
-          tag: "proxy", protocol: "vless",
-          settings: {vnext: [{address: $address, port: 443, users: [{id: $id, encryption: "none"}]}]},
-          streamSettings: {network: "xhttp", security: "tls", tlsSettings: {serverName: $server_name, fingerprint: $fingerprint, alpn: ["h2"]}, xhttpSettings: {host: $server_name, path: $path, mode: "packet-up"}}
-        }]
-      }
-    ' >"${xhttp_config}"
+    local runtime="$1" self_config="$2" external_config="$3" xhttp_config="$4" hysteria_config="$5"
+    local xhttp_id hysteria_auth
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        render_reality_auth_client "${runtime}" "${RAW_TAG}" "${REALITY_SNI}" \
+            "${REALITY_PUBLIC_KEY}" "${RAW_TEST_PORT}" "${self_config}"
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        render_reality_auth_client "${runtime}" "${EXTERNAL_REALITY_TAG}" "${EXTERNAL_REALITY_SNI}" \
+            "${EXTERNAL_REALITY_PUBLIC_KEY}" "${EXTERNAL_REALITY_TEST_PORT}" "${external_config}"
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        xhttp_id="$(jq -r --arg tag "${XHTTP_TAG}" \
+            '.inbounds[] | select(.tag == $tag) | .settings.clients[0].id // empty' "${runtime}")"
+        validate_uuid "${xhttp_id}" || die 'No active user credential was injected into XHTTP inbound.'
+        jq -n --arg address "${EDGE_IPV4}" --arg id "${xhttp_id}" \
+            --arg server_name "${XHTTP_SNI}" --arg path "${XHTTP_PATH}" \
+            --arg fingerprint "${CLIENT_FINGERPRINT}" \
+            --argjson socks_port "${XHTTP_TEST_PORT}" '
+          {
+            log: {loglevel: "warning"},
+            inbounds: [{
+              tag: "socks-in", listen: "127.0.0.1", port: $socks_port,
+              protocol: "socks", settings: {auth: "noauth", udp: true}
+            }],
+            outbounds: [{
+              tag: "proxy", protocol: "vless",
+              settings: {vnext: [{address: $address, port: 443,
+                users: [{id: $id, encryption: "none"}]}]},
+              streamSettings: {
+                network: "xhttp", security: "tls",
+                tlsSettings: {serverName: $server_name, fingerprint: $fingerprint, alpn: ["h2"]},
+                xhttpSettings: {host: $server_name, path: $path, mode: "auto"}
+              }
+            }]
+          }
+        ' >"${xhttp_config}"
+        chmod 0600 "${xhttp_config}"
+    fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        hysteria_auth="$(jq -r --arg tag "${HYSTERIA_TAG}" '
-          .inbounds[] | select(.tag == $tag) | .settings.clients[0].auth // empty
-        ' "${runtime}")"
+        hysteria_auth="$(jq -r --arg tag "${HYSTERIA_TAG}" \
+            '.inbounds[] | select(.tag == $tag) | .settings.clients[0].auth // empty' "${runtime}")"
         validate_uuid "${hysteria_auth}" || die 'No active user credential was injected into Hysteria2 inbound.'
         jq -n --arg address "${EDGE_IPV4}" --arg auth "${hysteria_auth}" \
             --arg server_name "${XHTTP_SNI}" --arg pin "${HYSTERIA_CERT_SHA256}" \
@@ -2728,8 +3235,10 @@ render_auth_clients() {
             --argjson socks_port "${HYSTERIA_TEST_PORT}" '
           {
             log: {loglevel: "warning"},
-            inbounds: [{tag: "socks-in", listen: "127.0.0.1", port: $socks_port,
-              protocol: "socks", settings: {auth: "noauth", udp: true}}],
+            inbounds: [{
+              tag: "socks-in", listen: "127.0.0.1", port: $socks_port,
+              protocol: "socks", settings: {auth: "noauth", udp: true}
+            }],
             outbounds: [{
               tag: "proxy", protocol: "hysteria",
               settings: {address: $address, port: 443, version: 2},
@@ -2744,9 +3253,8 @@ render_auth_clients() {
             }]
           }
         ' >"${hysteria_config}"
+        chmod 0600 "${hysteria_config}"
     fi
-    chmod 0600 "${raw_config}" "${xhttp_config}"
-    [[ "${ENABLE_HYSTERIA}" != 1 ]] || chmod 0600 "${hysteria_config}"
 }
 
 validate_client_config() {
@@ -2782,8 +3290,11 @@ run_transport_test() {
 
 verify_auth_stage() {
     announce_stage verify-auth
-    local temp_dir runtime raw_config raw_fragment_config xhttp_config hysteria_config
-    local raw_test_container raw_fragment_test_container xhttp_test_container hysteria_test_container
+    local temp_dir runtime raw_config external_config raw_fragment_config xhttp_config hysteria_config
+    local fragment_base_config fragment_label
+    local raw_test_container external_test_container raw_fragment_test_container
+    local xhttp_test_container hysteria_test_container port
+    local -a selected_test_ports=()
     require_root
     need_commands
     load_state
@@ -2791,56 +3302,93 @@ verify_auth_stage() {
     check_container_health "${NODE_CONTAINER}" "${NODE_IMAGE}"
     check_container_health "${HAPROXY_CONTAINER}" "${HAPROXY_IMAGE}"
     check_container_health "${CADDY_CONTAINER}" "${CADDY_IMAGE}"
-    for port in "${RAW_TEST_PORT}" "${RAW_FRAGMENT_TEST_PORT}" "${XHTTP_TEST_PORT}" "${HYSTERIA_TEST_PORT}"; do
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || selected_test_ports+=("${RAW_TEST_PORT}")
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || selected_test_ports+=("${EXTERNAL_REALITY_TEST_PORT}")
+    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || selected_test_ports+=("${RAW_FRAGMENT_TEST_PORT}")
+    [[ "${ENABLE_XHTTP}" != 1 ]] || selected_test_ports+=("${XHTTP_TEST_PORT}")
+    [[ "${ENABLE_HYSTERIA}" != 1 ]] || selected_test_ports+=("${HYSTERIA_TEST_PORT}")
+    for port in "${selected_test_ports[@]}"; do
         port_is_listening "${port}" && die "Temporary test port ${port} is occupied."
     done
     raw_test_container="rw-edge-test-raw-${NODE_CODE_LOWER}"
+    external_test_container="rw-edge-test-ext-${NODE_CODE_LOWER}"
     raw_fragment_test_container="rw-edge-test-raw-fragment-${NODE_CODE_LOWER}"
     xhttp_test_container="rw-edge-test-xhttp-${NODE_CODE_LOWER}"
     hysteria_test_container="rw-edge-test-hy2-${NODE_CODE_LOWER}"
-    docker inspect "${raw_test_container}" >/dev/null 2>&1 && die "Stale test container exists: ${raw_test_container}"
-    docker inspect "${raw_fragment_test_container}" >/dev/null 2>&1 && die "Stale test container exists: ${raw_fragment_test_container}"
-    docker inspect "${xhttp_test_container}" >/dev/null 2>&1 && die "Stale test container exists: ${xhttp_test_container}"
-    docker inspect "${hysteria_test_container}" >/dev/null 2>&1 && die "Stale test container exists: ${hysteria_test_container}"
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || ! docker inspect "${raw_test_container}" >/dev/null 2>&1 || \
+        die "Stale test container exists: ${raw_test_container}"
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
+        ! docker inspect "${external_test_container}" >/dev/null 2>&1 || \
+        die "Stale test container exists: ${external_test_container}"
+    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || \
+        ! docker inspect "${raw_fragment_test_container}" >/dev/null 2>&1 || \
+        die "Stale test container exists: ${raw_fragment_test_container}"
+    [[ "${ENABLE_XHTTP}" != 1 ]] || ! docker inspect "${xhttp_test_container}" >/dev/null 2>&1 || \
+        die "Stale test container exists: ${xhttp_test_container}"
+    [[ "${ENABLE_HYSTERIA}" != 1 ]] || \
+        ! docker inspect "${hysteria_test_container}" >/dev/null 2>&1 || \
+        die "Stale test container exists: ${hysteria_test_container}"
 
     temp_dir="$(mktemp -d)"
     runtime="${temp_dir}/runtime.json"
     raw_config="${temp_dir}/raw-client.json"
+    external_config="${temp_dir}/external-client.json"
     raw_fragment_config="${temp_dir}/raw-fragment-client.json"
     xhttp_config="${temp_dir}/xhttp-client.json"
     hysteria_config="${temp_dir}/hysteria-client.json"
     auth_cleanup() {
         docker stop --time 2 "${raw_test_container}" >/dev/null 2>&1 || true
+        docker stop --time 2 "${external_test_container}" >/dev/null 2>&1 || true
         docker stop --time 2 "${raw_fragment_test_container}" >/dev/null 2>&1 || true
         docker stop --time 2 "${xhttp_test_container}" >/dev/null 2>&1 || true
         docker stop --time 2 "${hysteria_test_container}" >/dev/null 2>&1 || true
         if [[ -f "${runtime}" ]]; then truncate -s 0 "${runtime}"; fi
         if [[ -f "${raw_config}" ]]; then truncate -s 0 "${raw_config}"; fi
+        if [[ -f "${external_config}" ]]; then truncate -s 0 "${external_config}"; fi
         if [[ -f "${raw_fragment_config}" ]]; then truncate -s 0 "${raw_fragment_config}"; fi
         if [[ -f "${xhttp_config}" ]]; then truncate -s 0 "${xhttp_config}"; fi
         if [[ -f "${hysteria_config}" ]]; then truncate -s 0 "${hysteria_config}"; fi
-        rm -rf -- "${temp_dir}"
+        find "${temp_dir}" -depth -delete 2>/dev/null || true
     }
     trap auth_cleanup EXIT RETURN
     install -m 0600 /dev/null "${runtime}"
     docker exec "${NODE_CONTAINER}" cli --dump-config-raw >"${runtime}" 2>/dev/null || \
         die 'Could not read protected live Node config.'
-    render_auth_clients "${runtime}" "${raw_config}" "${xhttp_config}" "${hysteria_config}"
-    validate_client_config "${raw_config}"
-    validate_client_config "${xhttp_config}"
-    run_transport_test 'RAW REALITY' "${raw_test_container}" "${RAW_TEST_PORT}" "${raw_config}"
+    render_auth_clients "${runtime}" "${raw_config}" "${external_config}" \
+        "${xhttp_config}" "${hysteria_config}"
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        validate_client_config "${raw_config}"
+        run_transport_test 'RAW REALITY self-SNI' "${raw_test_container}" \
+            "${RAW_TEST_PORT}" "${raw_config}"
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        validate_client_config "${external_config}"
+        run_transport_test "RAW REALITY ${EXTERNAL_REALITY_SNI}" "${external_test_container}" \
+            "${EXTERNAL_REALITY_TEST_PORT}" "${external_config}"
+    fi
     if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
+        if [[ "${FRAGMENT_REALITY}" == external ]]; then
+            fragment_base_config="${external_config}"
+            fragment_label="RAW REALITY ${EXTERNAL_REALITY_SNI} + client fragment"
+        else
+            fragment_base_config="${raw_config}"
+            fragment_label='RAW REALITY self-SNI + client fragment'
+        fi
         jq --argjson socks_port "${RAW_FRAGMENT_TEST_PORT}" \
           --slurpfile fm "${INSTALL_DIR}/finalmask-fragment-canary.json" '
           .inbounds[0].port = $socks_port |
           .outbounds[0].streamSettings.finalmask = $fm[0]
-        ' "${raw_config}" >"${raw_fragment_config}"
+        ' "${fragment_base_config}" >"${raw_fragment_config}"
         chmod 0600 "${raw_fragment_config}"
         validate_client_config "${raw_fragment_config}"
-        run_transport_test 'RAW REALITY + client fragment' "${raw_fragment_test_container}" \
+        run_transport_test "${fragment_label}" "${raw_fragment_test_container}" \
             "${RAW_FRAGMENT_TEST_PORT}" "${raw_fragment_config}"
     fi
-    run_transport_test 'TLS/XHTTP' "${xhttp_test_container}" "${XHTTP_TEST_PORT}" "${xhttp_config}"
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        validate_client_config "${xhttp_config}"
+        run_transport_test 'TLS/XHTTP auto' "${xhttp_test_container}" \
+            "${XHTTP_TEST_PORT}" "${xhttp_config}"
+    fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
         validate_client_config "${hysteria_config}"
         run_transport_test 'Hysteria2' "${hysteria_test_container}" "${HYSTERIA_TEST_PORT}" "${hysteria_config}"
@@ -2866,11 +3414,17 @@ status_stage() {
     require_root
     load_state
     validate_loaded_state
-    local container state restarts reality_answers xhttp_answers
+    local container state restarts reality_answers xhttp_answers external_answers
     reality_answers="$(dig +short A "${REALITY_SNI}" | paste -sd, -)"
-    xhttp_answers="$(dig +short A "${XHTTP_SNI}" | paste -sd, -)"
     reality_answers="${reality_answers:-unresolved}"
-    xhttp_answers="${xhttp_answers:-unresolved}"
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        xhttp_answers="$(dig +short A "${XHTTP_SNI}" | paste -sd, -)"
+        xhttp_answers="${xhttp_answers:-unresolved}"
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        external_answers="$(dig +short A "${EXTERNAL_REALITY_SNI}" | paste -sd, -)"
+        external_answers="${external_answers:-unresolved}"
+    fi
     ui_kv 'Install directory' "${INSTALL_DIR}"
     ui_kv 'Versions' "Panel 2.8.1 | Node 2.8.0 | Xray ${EXPECTED_XRAY_VERSION} | wizard ${SCRIPT_VERSION}"
     ui_section 'DNS' 'current public A answers'
@@ -2879,10 +3433,21 @@ status_stage() {
     else
         ui_status_row check "${REALITY_SNI}" "${reality_answers} (expected ${EDGE_IPV4})"
     fi
-    if [[ "${xhttp_answers}" == "${EDGE_IPV4}" ]]; then
-        ui_status_row ok "${XHTTP_SNI}" "${xhttp_answers}"
-    else
-        ui_status_row check "${XHTTP_SNI}" "${xhttp_answers} (expected ${EDGE_IPV4})"
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        if [[ "${xhttp_answers}" == "${EDGE_IPV4}" ]]; then
+            ui_status_row ok "${XHTTP_SNI}" "${xhttp_answers}"
+        else
+            ui_status_row check "${XHTTP_SNI}" "${xhttp_answers} (expected ${EDGE_IPV4})"
+        fi
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        if [[ "${external_answers}" != unresolved && "${external_answers}" != *"${EDGE_IPV4}"* ]]; then
+            ui_status_row ok "External ${EXTERNAL_REALITY_SNI}" \
+                "${external_answers}; regional CDN answer"
+        else
+            ui_status_row check "External ${EXTERNAL_REALITY_SNI}" \
+                "${external_answers}; must resolve away from ${EDGE_IPV4}"
+        fi
     fi
     ui_section 'Containers' 'state and lifetime restart counter'
     for container in "${NODE_CONTAINER}" "${HAPROXY_CONTAINER}" "${CADDY_CONTAINER}"; do
@@ -2901,8 +3466,13 @@ status_stage() {
     ui_section 'Listeners' 'public edge and loopback backends'
     status_tcp_listener 'TCP/443' 443 "${HAPROXY_CONTAINER}"
     status_tcp_listener "TCP/${NODE_PORT}" "${NODE_PORT}" "${NODE_CONTAINER}"
-    status_tcp_listener "TCP/${RAW_BACKEND_PORT}" "${RAW_BACKEND_PORT}" "${NODE_CONTAINER}"
-    status_tcp_listener "TCP/${XHTTP_BACKEND_PORT}" "${XHTTP_BACKEND_PORT}" "${NODE_CONTAINER}"
+    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || \
+        status_tcp_listener "TCP/${RAW_BACKEND_PORT} self REALITY" "${RAW_BACKEND_PORT}" "${NODE_CONTAINER}"
+    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
+        status_tcp_listener "TCP/${EXTERNAL_REALITY_BACKEND_PORT} external REALITY" \
+            "${EXTERNAL_REALITY_BACKEND_PORT}" "${NODE_CONTAINER}"
+    [[ "${ENABLE_XHTTP}" != 1 ]] || \
+        status_tcp_listener "TCP/${XHTTP_BACKEND_PORT} XHTTP" "${XHTTP_BACKEND_PORT}" "${NODE_CONTAINER}"
     status_tcp_listener "TCP/${CADDY_BACKEND_PORT}" "${CADDY_BACKEND_PORT}" "${CADDY_CONTAINER}"
     status_tcp_listener "TCP/${HYSTERIA_MASQ_PORT}" "${HYSTERIA_MASQ_PORT}" "${CADDY_CONTAINER}"
     status_tcp_listener "TCP/${HAPROXY_STATS_PORT}" "${HAPROXY_STATS_PORT}" "${HAPROXY_CONTAINER}"
@@ -3083,7 +3653,7 @@ selftest_stage() {
     original_install="${INSTALL_DIR}"
     temp_root="$(mktemp -d /tmp/remnawave-edge-selftest.XXXXXX)"
     selftest_cleanup() {
-        rm -rf -- "${temp_root}"
+        find "${temp_root}" -depth -delete 2>/dev/null || true
         INSTALL_DIR="${original_install}"
         set_paths
     }
@@ -3100,11 +3670,18 @@ selftest_stage() {
     NODE_CODE='A1B2C3D4'
     NODE_CODE_LOWER='a1b2c3d4'
     PROFILE_NAME='RW-EDGE-A1B2C3D4'
-    RAW_TAG='RW_A1B2C3D4_RAW_REALITY'
+    RAW_TAG='RW_A1B2C3D4_RAW_REALITY_SELF'
+    EXTERNAL_REALITY_TAG='RW_A1B2C3D4_RAW_REALITY_EXTERNAL'
     XHTTP_TAG='RW_A1B2C3D4_XHTTP_TLS'
     HYSTERIA_TAG='RW_A1B2C3D4_HYSTERIA2'
+    ENABLE_SELF_REALITY=1
+    ENABLE_EXTERNAL_REALITY=1
+    ENABLE_XHTTP=1
     ENABLE_HYSTERIA=1
     ENABLE_RAW_FRAGMENT=1
+    FRAGMENT_REALITY='external'
+    EXTERNAL_REALITY_TARGET='dl.google.com:443'
+    EXTERNAL_REALITY_SNI='dl.google.com'
     CLIENT_FINGERPRINT='firefox'
     BLOCK_CLIENT_QUIC=1
     APPLY_TUNING=1
@@ -3113,6 +3690,7 @@ selftest_stage() {
     CADDY_CONTAINER='rw-edge-caddy-a1b2c3d4'
     COMPOSE_PROJECT='rw-edge-a1b2c3d4'
     RAW_HOST_UUID='11111111-1111-4111-8111-111111111111'
+    EXTERNAL_REALITY_HOST_UUID='66666666-6666-4666-8666-666666666666'
     RAW_FRAGMENT_HOST_UUID='55555555-5555-4555-8555-555555555555'
     XHTTP_HOST_UUID='22222222-2222-4222-8222-222222222222'
     HYSTERIA_HOST_UUID='44444444-4444-4444-8444-444444444444'

@@ -6,7 +6,7 @@
 
 Зафиксированная совместимая база:
 
-- NodeInstallator `2026-08-13.4`;
+- NodeInstallator `2026-08-13.5`;
 - Remnawave Panel/Backend `2.8.1`;
 - Remnawave Node `2.8.0`;
 - встроенный Xray `26.6.27`;
@@ -21,17 +21,25 @@
 
 ```text
 TCP/443 -> HAProxy SNI routing
-             |-- VLESS RAW + REALITY + Vision
-             `-- Caddy TLS/HTTP2 -> VLESS XHTTP packet-up
+             |-- VLESS RAW + REALITY self-SNI + Vision
+             |-- VLESS RAW + REALITY external target + Vision
+             `-- Caddy TLS/HTTP2 -> VLESS XHTTP auto
 
 UDP/443 -> optional Hysteria2
 
 Panel -> allowlisted Node API port -> Remnawave Node -> managed Xray
 ```
 
-- RAW/REALITY использует локальный HTTPS cover-site и не создаёт петлю через
-  публичный `443`;
-- XHTTP работает за обычным TLS/HTTP/2 и случайным закрытым path;
+- self-SNI RAW/REALITY использует локальный HTTPS cover-site и не создаёт петлю
+  через публичный `443`;
+- внешний RAW/REALITY может автоматически выбрать самый быстрый валидный на
+  этой ноде target из `dl.google.com`, `www.amd.com` и `www.tesla.com`; мастер
+  проверяет DNS, сертификат, TLS 1.3, Xray handshake и делает три замера TLS;
+- для внешнего target включён лимит только неавторизованного fallback-трафика,
+  чтобы сканер не превратил ноду в неограниченный CDN-forwarder;
+- XHTTP работает за обычным TLS/HTTP/2, случайным закрытым path и режимом
+  `auto`; на HTTP/2 это обычно выбирает быстрый `stream-up`, не фиксируя
+  `packet-up` для всех клиентов;
 - Hysteria2 включается отдельно и использует `UDP/443`;
 - Xray/Caddy/HAProxy backend-порты остаются на loopback;
 - Node API разрешается только реально наблюдаемому egress IP панели;
@@ -43,7 +51,8 @@ Panel -> allowlisted Node API port -> Remnawave Node -> managed Xray
 - чистый Ubuntu или Debian с `apt` и systemd;
 - root/sudo и доступ к provider console/OOB;
 - публичный IPv4 сервера;
-- два разных домена с A-записями на этот IPv4;
+- один собственный cover/self-SNI домен с A-записью на этот IPv4;
+- второй собственный домен нужен только при выборе XHTTP;
 - стабильный исходящий/NAT IPv4 Remnawave Panel для allowlist Node API;
 - открытый `TCP/443`, а для Hysteria2 также `UDP/443`, в firewall провайдера.
 
@@ -118,6 +127,29 @@ sudo RW_QUIET=1 ./remnawave-edge-oneclick.sh verify
 Точные имена inbound, Host visibility, SNI, port, fingerprint, path и template
 показываются в файлах `PANEL-STAGE-1.txt` и `PANEL-STAGE-2.txt` внутри
 защищённого каталога установки.
+
+## Выбор транспортов и SNI
+
+Во время `init` мастер отдельно спрашивает про self-SNI REALITY, внешний
+REALITY, XHTTP и Hysteria2. Можно включить любой один транспорт или сочетание;
+для каждого выбранного пути генерируется отдельный inbound и физический Host.
+Рекомендуемый canary-набор — все четыре, после измерений можно убрать лишнее.
+
+Для внешнего REALITY пункт `Auto benchmark` выбирает не «вечный лучший SNI», а
+лучший из доступных кандидатов именно с текущей ноды в момент установки. CDN
+ответы региональны и могут меняться. Поэтому `verify` повторно проверяет target,
+а пользовательские тесты из нужных российских сетей всё равно обязательны.
+Обычный TLS/XHTTP на чужом имени мастер не предлагает: для него нужен
+сертификат, соответствующий домену; чужое имя здесь применимо именно как
+REALITY target/SNI.
+
+Короткие значения для автоматизации тоже поддерживаются:
+
+```bash
+RW_EXTERNAL_REALITY_TARGET=amd       # -> www.amd.com:443
+RW_EXTERNAL_REALITY_TARGET=tesla     # -> www.tesla.com:443
+RW_EXTERNAL_REALITY_TARGET=dl.google # -> dl.google.com:443
+```
 
 ## Безопасность
 
