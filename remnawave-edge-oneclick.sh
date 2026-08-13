@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-13.5'
+SCRIPT_VERSION='2026-08-13.6'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -355,6 +355,19 @@ set_paths() {
     esac
     STATE_FILE="${INSTALL_DIR}/private/state.env"
     PRIVATE_DIR="${INSTALL_DIR}/private"
+}
+
+persist_installer() {
+    local source_path="${BASH_SOURCE[0]}" target_path="${INSTALL_DIR}/remnawave-edge-oneclick.sh"
+    install -d -m 0755 "${INSTALL_DIR}"
+    if [[ -r "${source_path}" ]] && \
+       [[ "$(realpath -m -- "${source_path}")" != "$(realpath -m -- "${target_path}")" ]]; then
+        install -m 0700 "${source_path}" "${target_path}"
+    elif [[ ! -x "${target_path}" ]]; then
+        warn "Could not persist the running installer at ${target_path}; keep the launch command for resume."
+        return 0
+    fi
+    log "Reusable installer saved at ${target_path}."
 }
 
 require_root() {
@@ -2182,11 +2195,11 @@ check_dns() {
 }
 
 port_is_listening() {
-    ss -H -ltn "sport = :$1" | grep -Fq .
+    [[ -n "$(ss -H -ltn "sport = :$1")" ]]
 }
 
 udp_port_is_listening() {
-    ss -H -lun "sport = :$1" | grep -Fq .
+    [[ -n "$(ss -H -lun "sport = :$1")" ]]
 }
 
 port_is_loopback_only() {
@@ -2236,10 +2249,11 @@ assert_port_free_or_owned() {
 }
 
 snapshot_ufw_state() {
-    local label="$1" path
+    local label="$1" path ufw_status
     STAGE_UFW_SNAPSHOT="$(mktemp -d "${PRIVATE_DIR}/.${label}-ufw.XXXXXX")"
     chmod 0700 "${STAGE_UFW_SNAPSHOT}"
-    if ufw status | grep -Fq 'Status: active'; then
+    ufw_status="$(ufw status)"
+    if grep -Fq 'Status: active' <<<"${ufw_status}"; then
         printf 'active\n' >"${STAGE_UFW_SNAPSHOT}/status"
     else
         printf 'inactive\n' >"${STAGE_UFW_SNAPSHOT}/status"
@@ -2306,7 +2320,8 @@ rollback_failed_stage() {
             for tuning_file in \
                 "${PRIVATE_DIR}/sysctl-before.txt" \
                 "${PRIVATE_DIR}/sysctl-file.before" \
-                "${PRIVATE_DIR}/modules-file.before"; do
+                "${PRIVATE_DIR}/modules-file.before" \
+                "${PRIVATE_DIR}/qdisc-before.txt"; do
                 [[ ! -e "${tuning_file}" ]] || find "${tuning_file}" -maxdepth 0 -delete
             done
         fi
@@ -2526,6 +2541,7 @@ init_stage() {
     require_root
     set_paths
     need_commands
+    persist_installer
     if [[ -f "${STATE_FILE}" ]]; then
         load_state
         validate_loaded_state
@@ -2685,6 +2701,20 @@ panel_stage() {
 
 save_node_secret() {
     local secret="${RW_NODE_SECRET_KEY:-}"
+    if [[ -z "${secret}" && -f "${PRIVATE_DIR}/node.env" && ! -L "${PRIVATE_DIR}/node.env" ]] && \
+       [[ "$(stat -c '%a:%u' "${PRIVATE_DIR}/node.env")" == '600:0' ]] && \
+       awk '
+         BEGIN {count=0; valid=0}
+         /^SECRET_KEY=/ {
+           count++
+           value=substr($0, 12)
+           if (length(value) >= 32 && value != "__PANEL_SECRET_REQUIRED__" && value !~ /[[:space:]]/) valid=1
+         }
+         END {exit !(count == 1 && valid == 1)}
+       ' "${PRIVATE_DIR}/node.env"; then
+        log 'Reusing the protected Node SECRET_KEY already saved by the previous attempt.'
+        return 0
+    fi
     if [[ -z "${secret}" ]]; then
         if [[ "${NON_INTERACTIVE}" == 1 || ! -t 0 ]]; then
             die 'RW_NODE_SECRET_KEY is required for the node stage.'
@@ -2713,6 +2743,20 @@ panel_session_present() {
     '
 }
 
+panel_control_observed() {
+    local started_at
+    panel_session_present && return 0
+    container_is_running "${NODE_CONTAINER}" || return 1
+    started_at="$(docker inspect -f '{{.State.StartedAt}}' "${NODE_CONTAINER}" 2>/dev/null || true)"
+    [[ -n "${started_at}" ]] || return 1
+    docker logs --since "${started_at}" "${NODE_CONTAINER}" 2>&1 | tr -d '\000' | \
+        awk -v ip="${PANEL_IPV4}" '
+          index($0, "Attempt to start XTLS took:") &&
+          (index($0, "(IP: " ip ")") || index($0, "(IP: ::ffff:" ip ")")) {found=1}
+          END {exit !found}
+        '
+}
+
 wait_for_node_ready() {
     local attempt ready
     for attempt in $(seq 1 90); do
@@ -2723,15 +2767,15 @@ wait_for_node_ready() {
             port_is_listening "${EXTERNAL_REALITY_BACKEND_PORT}" || ready=0
         [[ "${ENABLE_XHTTP}" != 1 ]] || port_is_listening "${XHTTP_BACKEND_PORT}" || ready=0
         [[ "${ENABLE_HYSTERIA}" != 1 ]] || udp_port_is_listening 443 || ready=0
-        panel_session_present || ready=0
+        panel_control_observed || ready=0
         if [[ "${ready}" == 1 ]]; then
-            log 'Node API, all selected Xray transports and an established Panel session are ready.'
+            log 'Node API, all selected Xray transports and a successful Panel management exchange are ready.'
             return 0
         fi
         sleep 2
     done
     docker logs --tail 40 "${NODE_CONTAINER}" 2>&1 | sed -E 's/(SECRET_KEY=)[^ ]+/\1[REDACTED]/g' >&2 || true
-    die 'Node did not become Panel-managed within 180 seconds. Recheck Panel address/port/profile/inbounds and provider firewall.'
+    die "Node did not become Panel-managed within 180 seconds. Resume with: sudo ${INSTALL_DIR}/remnawave-edge-oneclick.sh node"
 }
 
 check_negative_mtls() {
@@ -2749,6 +2793,7 @@ check_negative_mtls() {
 
 apply_tuning_loaded() {
     local key snapshot="${PRIVATE_DIR}/sysctl-before.txt" snapshot_tmp default_interface live_qdisc
+    local qdisc_snapshot="${PRIVATE_DIR}/qdisc-before.txt"
     local sysctl_target='/etc/sysctl.d/99-remnawave-edge.conf'
     local module_target='/etc/modules-load.d/remnawave-edge.conf'
     local keys=(
@@ -2769,18 +2814,24 @@ apply_tuning_loaded() {
         [[ ! -f "${module_target}" ]] || cp -a "${module_target}" "${PRIVATE_DIR}/modules-file.before"
         STAGE_TUNING_WAS_NEW=1
     fi
+    default_interface="$(ip -4 route show default | awk 'NR == 1 {print $5}')"
+    [[ "${default_interface}" =~ ^[A-Za-z0-9_.:-]+$ ]] || die 'Could not determine a safe default network interface.'
+    live_qdisc="$(tc qdisc show dev "${default_interface}" 2>/dev/null | awk 'NR == 1 {print $2}')"
+    [[ -n "${live_qdisc}" ]] || die "Could not read the live qdisc on ${default_interface}."
+    if [[ ! -f "${qdisc_snapshot}" ]]; then
+        printf '%s\t%s\n' "${default_interface}" "${live_qdisc}" >"${qdisc_snapshot}"
+        chmod 0600 "${qdisc_snapshot}"
+    fi
     modprobe tcp_bbr
     install -m 0644 "${INSTALL_DIR}/99-remnawave-edge.conf" "${sysctl_target}"
     printf 'tcp_bbr\n' >"${module_target}"
     chmod 0644 "${module_target}"
     sysctl --system >/dev/null
     [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == bbr ]] || die 'BBR did not become active.'
-    default_interface="$(ip -4 route show default | awk 'NR == 1 {print $5}')"
+    tc qdisc replace dev "${default_interface}" root fq
     live_qdisc="$(tc qdisc show dev "${default_interface}" 2>/dev/null | awk 'NR == 1 {print $2}')"
-    if [[ "${live_qdisc}" != fq ]]; then
-        warn "default_qdisc=fq is saved for future interfaces, but ${default_interface:-default interface} currently uses ${live_qdisc:-unknown}; no disruptive live qdisc replacement was made."
-    fi
-    log 'Applied reversible BBR, MTU probing, backlog and UDP socket-buffer baseline.'
+    [[ "${live_qdisc}" == fq ]] || die "Could not activate fq on ${default_interface}."
+    log "Applied reversible BBR, live fq on ${default_interface}, MTU probing, backlog and UDP socket buffers."
 }
 
 tune_stage() {
@@ -2800,7 +2851,7 @@ tune_stage() {
 }
 
 restore_tuning_loaded() {
-    local line key value snapshot sysctl_target module_target
+    local line key value snapshot sysctl_target module_target qdisc_interface qdisc_kind
     snapshot="${PRIVATE_DIR}/sysctl-before.txt"
     sysctl_target='/etc/sysctl.d/99-remnawave-edge.conf'
     module_target='/etc/modules-load.d/remnawave-edge.conf'
@@ -2820,7 +2871,19 @@ restore_tuning_loaded() {
         value="${line#*=}"
         sysctl -w "${key}=${value}" >/dev/null
     done <"${snapshot}"
-    log 'Restored the exact sysctl values recorded before tuning.'
+    if [[ -f "${PRIVATE_DIR}/qdisc-before.txt" ]]; then
+        IFS=$'\t' read -r qdisc_interface qdisc_kind <"${PRIVATE_DIR}/qdisc-before.txt"
+        [[ "${qdisc_interface}" =~ ^[A-Za-z0-9_.:-]+$ ]] || die 'Recorded qdisc interface is unsafe.'
+        case "${qdisc_kind}" in
+            fq|fq_codel|cake|pfifo_fast)
+                tc qdisc replace dev "${qdisc_interface}" root "${qdisc_kind}"
+                ;;
+            *)
+                warn "Recorded qdisc ${qdisc_kind:-unknown} cannot be safely reconstructed automatically."
+                ;;
+        esac
+    fi
+    log 'Restored the recorded sysctl and supported live-qdisc values from before tuning.'
 }
 
 untune_stage() {
@@ -2860,7 +2923,7 @@ node_stage() {
             die 'Existing managed Node has no external REALITY listener.'
         [[ "${ENABLE_XHTTP}" != 1 ]] || port_is_listening "${XHTTP_BACKEND_PORT}" || \
             die 'Existing managed Node has no XHTTP listener.'
-        panel_session_present || die 'Existing managed Node has no established Panel session.'
+        panel_control_observed || die 'Existing managed Node has no successful Panel management exchange.'
         check_negative_mtls
         [[ "${ENABLE_XHTTP}" != 1 ]] || check_runtime_path
         log 'Existing managed Node passed control-plane and runtime-contract checks; it was not recreated.'
@@ -2953,6 +3016,17 @@ wait_for_public_tls() {
     return 1
 }
 
+wait_for_owned_tcp_listener() {
+    local port="$1" container="$2" attempt
+    for attempt in $(seq 1 40); do
+        if port_is_listening "${port}" && tcp_port_owned_by_container "${port}" "${container}"; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
 edge_stage() {
     local haproxy_was_running=0 caddy_was_running=0
     announce_stage edge
@@ -2973,7 +3047,7 @@ edge_stage() {
         die 'External REALITY backend is not listening.'
     [[ "${ENABLE_XHTTP}" != 1 ]] || port_is_listening "${XHTTP_BACKEND_PORT}" || \
         die 'XHTTP backend is not listening.'
-    panel_session_present || die 'No established Panel session to the Node API.'
+    panel_control_observed || die 'No successful Panel management exchange with the Node API.'
     assert_port_free_or_owned 443 "${HAPROXY_CONTAINER}"
     assert_port_free_or_owned "${CADDY_BACKEND_PORT}" "${CADDY_CONTAINER}"
     assert_port_free_or_owned "${HYSTERIA_MASQ_PORT}" "${CADDY_CONTAINER}"
@@ -2999,7 +3073,8 @@ edge_stage() {
     [[ "${haproxy_was_running}" == 1 ]] || STAGE_STOP_HAPROXY=1
     docker compose --env-file "${PRIVATE_DIR}/edge.env" \
         -f "${INSTALL_DIR}/docker-compose.edge.yml" up -d haproxy
-    port_is_listening 443 || die 'HAProxy did not bind public TCP/443.'
+    wait_for_owned_tcp_listener 443 "${HAPROXY_CONTAINER}" || \
+        die 'HAProxy did not bind public TCP/443 within 10 seconds.'
     log 'Starting Caddy and obtaining trusted certificates...'
     [[ "${caddy_was_running}" == 1 ]] || STAGE_STOP_CADDY=1
     docker compose --env-file "${PRIVATE_DIR}/edge.env" \
@@ -3129,7 +3204,7 @@ verify_stage() {
         port_is_loopback_only "${loopback_port}" || die "Backend ${loopback_port} is not loopback-only."
     done
     [[ -z "$(ss -H -ltn 'sport = :80')" ]] || die 'TCP/80 unexpectedly listens; this design uses TLS-ALPN on TCP/443 only.'
-    panel_session_present || die 'No established Panel session to Node API.'
+    panel_control_observed || die 'No successful Panel management exchange with the Node API.'
     check_negative_mtls
     check_https_cover "${REALITY_SNI}"
     if [[ "${ENABLE_XHTTP}" == 1 ]]; then
@@ -3488,9 +3563,11 @@ status_stage() {
     fi
     ui_section 'Control plane' 'Panel -> Node mTLS'
     if panel_session_present; then
-        ui_status_row ok 'Panel session' "established from ${PANEL_IPV4}"
+        ui_status_row ok 'Panel control' "session established from ${PANEL_IPV4}"
+    elif panel_control_observed; then
+        ui_status_row ok 'Panel control' "successful exchange observed from ${PANEL_IPV4}"
     else
-        ui_status_row check 'Panel session' 'absent'
+        ui_status_row check 'Panel control' 'no successful exchange observed'
     fi
 }
 

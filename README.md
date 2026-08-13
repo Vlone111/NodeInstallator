@@ -6,7 +6,7 @@
 
 Зафиксированная совместимая база:
 
-- NodeInstallator `2026-08-13.5`;
+- NodeInstallator `2026-08-13.6`;
 - Remnawave Panel/Backend `2.8.1`;
 - Remnawave Node `2.8.0`;
 - встроенный Xray `26.6.27`;
@@ -69,6 +69,11 @@ sudo ./remnawave-edge-oneclick.sh bootstrap
 sudo ./remnawave-edge-oneclick.sh selftest
 sudo ./remnawave-edge-oneclick.sh all
 ```
+
+При запуске через `bash <(curl ...)` мастер сохраняет собственную исполняемую
+копию в `/opt/remnawave-edge/remnawave-edge-oneclick.sh`. Повторный запуск после
+обрыва использует уже сохранённые защищённые значения и не просит Node
+`SECRET_KEY` второй раз.
 
 Запуск без аргументов открывает интерактивное меню:
 
