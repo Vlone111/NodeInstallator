@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-13.9'
+SCRIPT_VERSION='2026-08-13.10'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -40,7 +40,8 @@ EXTERNAL_REALITY_BACKEND_PORT=18445
 CADDY_BACKEND_PORT=19443
 HAPROXY_STATS_PORT=8404
 HYSTERIA_MASQ_PORT=19080
-HYSTERIA_CERT_CONTAINER_DIR='/etc/remnawave-edge/hysteria-tls'
+CADDY_DATA_CONTAINER_DIR='/var/lib/remnawave-edge/caddy-data'
+CADDY_LE_STORAGE_ID='acme-v02.api.letsencrypt.org-directory'
 RAW_TEST_PORT=21081
 XHTTP_TEST_PORT=21082
 HYSTERIA_TEST_PORT=21083
@@ -268,12 +269,8 @@ Optional environment variables:
   RW_EXTERNAL_REALITY_TARGET=host:443, RW_EXTERNAL_REALITY_SNI=host,
   RW_ENABLE_RAW_FRAGMENT=0|1, RW_FRAGMENT_REALITY=self|external,
   RW_CLIENT_FINGERPRINT (default: firefox),
-  RW_RAW_HOST_UUID, RW_EXTERNAL_REALITY_HOST_UUID,
-  RW_RAW_FRAGMENT_HOST_UUID, RW_XHTTP_HOST_UUID,
-  RW_HYSTERIA_HOST_UUID, RW_EXTRA_HOST_UUIDS=uuid5,uuid6,
   RW_BLOCK_CLIENT_QUIC=0|1, RW_APPLY_TUNING=0|1,
-  RW_SKIP_DNS=1, RW_SKIP_UFW=1, RW_ENABLE_UFW=1, RW_SSH_PORT,
-  RW_ACCEPT_BROAD_CONTROL=1,
+  RW_SKIP_DNS=1, RW_SKIP_UFW=1, RW_SSH_PORT,
   RW_CONFIRM_HOST_ROLLBACK=RESTORE,
   RW_NON_INTERACTIVE=1, RW_SHOW_VALUES=1,
   RW_NO_COLOR=1 (or NO_COLOR=1), RW_ASCII=1, RW_QUIET=1
@@ -503,7 +500,7 @@ PY
 
 select_external_reality_target() {
     local requested="${RW_EXTERNAL_REALITY_TARGET:-}" requested_sni="${RW_EXTERNAL_REALITY_SNI:-}"
-    local choice='' candidate best_target='' best_sni='' best_score='99.999999'
+    local candidate best_target='' best_sni='' best_score='99.999999'
     local -a candidates=('dl.google.com:443' 'www.amd.com:443' 'www.tesla.com:443')
     if [[ -n "${requested}" ]]; then
         EXTERNAL_REALITY_TARGET="$(normalize_external_target "${requested}")"
@@ -511,37 +508,6 @@ select_external_reality_target() {
         probe_external_reality_target "${EXTERNAL_REALITY_TARGET}" "${EXTERNAL_REALITY_SNI}" || \
             die "External REALITY target ${EXTERNAL_REALITY_TARGET} failed DNS/TLS/Xray validation."
         return 0
-    fi
-    if [[ "${NON_INTERACTIVE}" != 1 && -t 0 ]]; then
-        ui_section 'External REALITY target' 'measured from this Node; CDN answers are region-dependent'
-        cat <<'MENU'
-   1) Auto benchmark: Google Downloads, AMD and Tesla (recommended)
-   2) dl.google.com
-   3) www.amd.com
-   4) www.tesla.com
-   5) Custom hostname
-MENU
-        printf '\n%b?%b Select %b[1]%b: ' "${UI_CYAN}${UI_BOLD}" "${UI_RESET}" \
-            "${UI_DIM}" "${UI_RESET}"
-        IFS= read -r choice || die 'Input was interrupted.'
-        choice="${choice:-1}"
-        case "${choice}" in
-            1) ;;
-            2) candidates=('dl.google.com:443') ;;
-            3) candidates=('www.amd.com:443') ;;
-            4) candidates=('www.tesla.com:443') ;;
-            5)
-                EXTERNAL_REALITY_TARGET=''
-                EXTERNAL_REALITY_SNI=''
-                prompt_value EXTERNAL_REALITY_TARGET 'External REALITY target (hostname:443)'
-                EXTERNAL_REALITY_TARGET="$(normalize_external_target "${EXTERNAL_REALITY_TARGET}")"
-                prompt_value EXTERNAL_REALITY_SNI 'External REALITY SNI' "${EXTERNAL_REALITY_TARGET%:*}"
-                probe_external_reality_target "${EXTERNAL_REALITY_TARGET}" "${EXTERNAL_REALITY_SNI}" || \
-                    die "External REALITY target ${EXTERNAL_REALITY_TARGET} failed DNS/TLS/Xray validation."
-                return 0
-                ;;
-            *) die "Unknown external target choice: ${choice}" ;;
-        esac
     fi
     log 'Benchmarking external REALITY targets from this Node...'
     for candidate in "${candidates[@]}"; do
@@ -563,27 +529,57 @@ MENU
     success "Selected ${EXTERNAL_REALITY_TARGET} as the fastest currently valid regional target (TLS ${best_score}s)."
 }
 
+caddy_volume_name() {
+    printf '%s-caddy-data' "${COMPOSE_PROJECT}"
+}
+
+hysteria_cert_relative_dir() {
+    printf 'caddy/certificates/%s/%s' "${CADDY_LE_STORAGE_ID}" "${XHTTP_SNI}"
+}
+
+hysteria_cert_container_path() {
+    printf '%s/%s/%s.crt' "${CADDY_DATA_CONTAINER_DIR}" \
+        "$(hysteria_cert_relative_dir)" "${XHTTP_SNI}"
+}
+
+hysteria_key_container_path() {
+    printf '%s/%s/%s.key' "${CADDY_DATA_CONTAINER_DIR}" \
+        "$(hysteria_cert_relative_dir)" "${XHTTP_SNI}"
+}
+
+caddy_hysteria_material_paths() {
+    local mountpoint
+    mountpoint="$(docker volume inspect -f '{{.Mountpoint}}' "$(caddy_volume_name)" 2>/dev/null || true)"
+    [[ -n "${mountpoint}" ]] || return 1
+    printf '%s\n%s\n' \
+        "${mountpoint}/$(hysteria_cert_relative_dir)/${XHTTP_SNI}.crt" \
+        "${mountpoint}/$(hysteria_cert_relative_dir)/${XHTTP_SNI}.key"
+}
+
 validate_hysteria_material() {
-    local cert="${PRIVATE_DIR}/hysteria-tls/server.crt"
-    local key="${PRIVATE_DIR}/hysteria-tls/server.key"
-    local actual_pin cert_pubkey key_pubkey
-    [[ -s "${cert}" && -s "${key}" ]] || die 'Hysteria TLS files are missing.'
-    [[ "$(stat -c '%a' "${cert}")" == 600 && "$(stat -c '%a' "${key}")" == 600 ]] || \
-        die 'Hysteria certificate and private key must have mode 0600.'
+    local cert key cert_pubkey key_pubkey subject issuer
+    local -a material=()
+    mapfile -t material < <(caddy_hysteria_material_paths)
+    ((${#material[@]} == 2)) || \
+        die 'Caddy certificate storage for Hysteria2 does not exist yet.'
+    cert="${material[0]}"
+    key="${material[1]}"
+    [[ -s "${cert}" && -s "${key}" ]] || \
+        die "Caddy has not stored the Hysteria2 certificate for ${XHTTP_SNI}."
     openssl x509 -in "${cert}" -noout -checkhost "${XHTTP_SNI}" >/dev/null || \
-        die 'Hysteria certificate SAN does not match XHTTP_SNI.'
-    openssl x509 -in "${cert}" -noout -checkend 2592000 >/dev/null || \
-        die 'Hysteria certificate expires in less than 30 days.'
-    actual_pin="$(openssl x509 -in "${cert}" -noout -fingerprint -sha256 | \
-        cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
-    [[ "${actual_pin}" == "${HYSTERIA_CERT_SHA256}" ]] || \
-        die 'Hysteria certificate no longer matches the protected SHA-256 pin.'
+        die 'Caddy Hysteria2 certificate SAN does not match the configured domain.'
+    openssl x509 -in "${cert}" -noout -checkend 1209600 >/dev/null || \
+        die 'Caddy Hysteria2 certificate expires in less than 14 days.'
+    subject="$(openssl x509 -in "${cert}" -noout -subject -nameopt RFC2253)"
+    issuer="$(openssl x509 -in "${cert}" -noout -issuer -nameopt RFC2253)"
+    [[ "${subject#subject=}" != "${issuer#issuer=}" ]] || \
+        die 'Caddy Hysteria2 certificate is self-signed; a public ACME chain is required.'
     cert_pubkey="$(openssl x509 -in "${cert}" -pubkey -noout | \
         openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256)"
     key_pubkey="$(openssl pkey -in "${key}" -pubout -outform DER 2>/dev/null | \
         openssl dgst -sha256)"
     [[ -n "${cert_pubkey}" && "${cert_pubkey}" == "${key_pubkey}" ]] || \
-        die 'Hysteria certificate and private key do not match.'
+        die 'Caddy Hysteria2 certificate and private key do not match.'
 }
 
 prompt_value() {
@@ -703,14 +699,6 @@ write_state() {
             printf 'EXTERNAL_REALITY_SHORT_ID=%q\n' "${EXTERNAL_REALITY_SHORT_ID}"
         }
         printf 'XHTTP_PATH=%q\n' "${XHTTP_PATH}"
-        [[ "${ENABLE_HYSTERIA}" != 1 ]] || printf 'HYSTERIA_CERT_SHA256=%q\n' "${HYSTERIA_CERT_SHA256}"
-        [[ -z "${RAW_HOST_UUID:-}" ]] || printf 'RAW_HOST_UUID=%q\n' "${RAW_HOST_UUID}"
-        [[ -z "${EXTERNAL_REALITY_HOST_UUID:-}" ]] || \
-            printf 'EXTERNAL_REALITY_HOST_UUID=%q\n' "${EXTERNAL_REALITY_HOST_UUID}"
-        [[ -z "${RAW_FRAGMENT_HOST_UUID:-}" ]] || printf 'RAW_FRAGMENT_HOST_UUID=%q\n' "${RAW_FRAGMENT_HOST_UUID}"
-        [[ -z "${XHTTP_HOST_UUID:-}" ]] || printf 'XHTTP_HOST_UUID=%q\n' "${XHTTP_HOST_UUID}"
-        [[ -z "${HYSTERIA_HOST_UUID:-}" ]] || printf 'HYSTERIA_HOST_UUID=%q\n' "${HYSTERIA_HOST_UUID}"
-        [[ -z "${EXTRA_HOST_UUIDS:-}" ]] || printf 'EXTRA_HOST_UUIDS=%q\n' "${EXTRA_HOST_UUIDS}"
     } >"${state_tmp}"; then
         truncate -s 0 "${state_tmp}" 2>/dev/null || true
         find "${state_tmp}" -maxdepth 0 -delete 2>/dev/null || true
@@ -774,6 +762,11 @@ load_state() {
             [[ -n "${!required:-}" ]] || missing+=("${required}")
         done
     fi
+    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
+        for required in HYSTERIA_TAG XHTTP_SNI; do
+            [[ -n "${!required:-}" ]] || missing+=("${required}")
+        done
+    fi
     ((${#missing[@]} == 0)) || die "Incomplete selected-transport state in ${INSTALL_DIR}: ${missing[*]}."
 }
 
@@ -824,23 +817,6 @@ generate_material() {
         [[ "${EXTERNAL_REALITY_SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] || \
             die 'Invalid generated external REALITY short ID.'
     fi
-}
-
-generate_hysteria_certificate() {
-    local cert_dir="${PRIVATE_DIR}/hysteria-tls"
-    install -d -m 0700 "${cert_dir}"
-    openssl ecparam -name prime256v1 -genkey -noout -out "${cert_dir}/server.key"
-    openssl req -new -x509 -sha256 -key "${cert_dir}/server.key" \
-        -out "${cert_dir}/server.crt" -days 3650 \
-        -subj "/CN=${XHTTP_SNI}" \
-        -addext "subjectAltName=DNS:${XHTTP_SNI}" \
-        -addext 'basicConstraints=critical,CA:FALSE' \
-        -addext 'keyUsage=critical,digitalSignature' \
-        -addext 'extendedKeyUsage=serverAuth'
-    chmod 0600 "${cert_dir}/server.key" "${cert_dir}/server.crt"
-    HYSTERIA_CERT_SHA256="$(openssl x509 -in "${cert_dir}/server.crt" \
-        -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')"
-    [[ "${HYSTERIA_CERT_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die 'Could not calculate Hysteria certificate pin.'
 }
 
 render_profile() {
@@ -945,9 +921,9 @@ EOF
         mv -f "${PRIVATE_DIR}/config-profile.ready.json.tmp" "${PRIVATE_DIR}/config-profile.ready.json"
     fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        jq --arg tag "${HYSTERIA_TAG}" \
-            --arg cert_path "${HYSTERIA_CERT_CONTAINER_DIR}/server.crt" \
-            --arg key_path "${HYSTERIA_CERT_CONTAINER_DIR}/server.key" \
+        jq --arg tag "${HYSTERIA_TAG}" --arg server_name "${XHTTP_SNI}" \
+            --arg cert_path "$(hysteria_cert_container_path)" \
+            --arg key_path "$(hysteria_key_container_path)" \
             --argjson masquerade_port "${HYSTERIA_MASQ_PORT}" '
           .inbounds += [
             {
@@ -961,9 +937,11 @@ EOF
                 security: "tls",
                 tlsSettings: {
                   alpn: ["h3"],
+                  serverName: $server_name,
                   certificates: [{
                     certificateFile: $cert_path,
-                    keyFile: $key_path
+                    keyFile: $key_path,
+                    oneTimeLoading: false
                   }]
                 },
                 hysteriaSettings: {
@@ -1097,6 +1075,11 @@ render_caddy() {
     auto_https disable_redirects
     https_port 19443
     email {$ACME_EMAIL}
+    cert_issuer acme {
+        dir https://acme-v02.api.letsencrypt.org/directory
+        disable_http_challenge
+        alt_tlsalpn_port 19443
+    }
     servers {
         protocols h1 h2
         strict_sni_host on
@@ -1140,10 +1123,6 @@ http://127.0.0.1:19080 {
 https://{$REALITY_SNI}:19443 {
     bind 127.0.0.1
     tls {
-        issuer acme {
-            disable_http_challenge
-            alt_tlsalpn_port 19443
-        }
         protocols tls1.2 tls1.3
         curves x25519mlkem768 x25519
     }
@@ -1164,10 +1143,6 @@ EOF
 https://{$XHTTP_SNI}:19443 {
     bind 127.0.0.1
     tls {
-        issuer acme {
-            disable_http_challenge
-            alt_tlsalpn_port 19443
-        }
         protocols tls1.2 tls1.3
         curves x25519mlkem768 x25519
     }
@@ -1296,7 +1271,23 @@ EOF
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
         cat >>"${INSTALL_DIR}/docker-compose.node.yml" <<EOF
     volumes:
-      - ./private/hysteria-tls:${HYSTERIA_CERT_CONTAINER_DIR}:ro
+      - caddy_data:${CADDY_DATA_CONTAINER_DIR}:ro
+EOF
+        # Upgrade bridge only: an existing 2026-08-13.9 installation may still
+        # be running the old Panel profile until the operator pastes the newly
+        # generated one. Keep that already-existing bind readable during the
+        # migration; fresh installations never create this directory.
+        if [[ -d "${PRIVATE_DIR}/hysteria-tls" ]]; then
+            cat >>"${INSTALL_DIR}/docker-compose.node.yml" <<EOF
+      - ./private/hysteria-tls:/etc/remnawave-edge/hysteria-tls:ro
+EOF
+        fi
+        cat >>"${INSTALL_DIR}/docker-compose.node.yml" <<EOF
+
+volumes:
+  caddy_data:
+    external: true
+    name: ${COMPOSE_PROJECT}-caddy-data
 EOF
     fi
 
@@ -1440,34 +1431,16 @@ EOF
 }
 
 render_auto_template() {
-    local raw_uuid='__RAW_HOST_UUID__'
-    local external_uuid='__EXTERNAL_REALITY_HOST_UUID__'
-    local raw_fragment_uuid='__RAW_FRAGMENT_HOST_UUID__'
-    local xhttp_uuid='__XHTTP_HOST_UUID__'
-    local hysteria_uuid='__HYSTERIA_HOST_UUID__'
-    local inject_placeholders='' ready=1 selected_json uuid
-    local -a selected_uuids extra_uuids
+    local remark_pattern="^RW ${NODE_CODE} (REALITY|XHTTP|HY2)( |$)"
     local output="${PRIVATE_DIR}/xray-json-auto.template.json"
-    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
-        inject_placeholders+="${inject_placeholders:+, }\"${raw_uuid}\""
-        [[ "${ENABLE_RAW_FRAGMENT}" != 1 || "${FRAGMENT_REALITY}" != self ]] || \
-            inject_placeholders+=", \"${raw_fragment_uuid}\""
-    fi
-    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
-        inject_placeholders+="${inject_placeholders:+, }\"${external_uuid}\""
-        [[ "${ENABLE_RAW_FRAGMENT}" != 1 || "${FRAGMENT_REALITY}" != external ]] || \
-            inject_placeholders+=", \"${raw_fragment_uuid}\""
-    fi
-    [[ "${ENABLE_XHTTP}" != 1 ]] || inject_placeholders+="${inject_placeholders:+, }\"${xhttp_uuid}\""
-    [[ "${ENABLE_HYSTERIA}" != 1 ]] || inject_placeholders+="${inject_placeholders:+, }\"${hysteria_uuid}\""
     cat >"${output}" <<EOF
 {
   "remnawave": {
     "injectHosts": [
       {
         "selector": {
-          "type": "uuids",
-          "values": [${inject_placeholders}]
+          "type": "remarkRegex",
+          "pattern": "${remark_pattern}"
         },
         "selectFrom": "HIDDEN",
         "tagPrefix": "proxy"
@@ -1576,36 +1549,7 @@ EOF
         mv -f "${output}.tmp" "${output}"
     fi
     chmod 0600 "${output}"
-    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
-        [[ -n "${RAW_HOST_UUID:-}" ]] && selected_uuids+=("${RAW_HOST_UUID}") || ready=0
-        if [[ "${ENABLE_RAW_FRAGMENT}" == 1 && "${FRAGMENT_REALITY}" == self ]]; then
-            [[ -n "${RAW_FRAGMENT_HOST_UUID:-}" ]] && selected_uuids+=("${RAW_FRAGMENT_HOST_UUID}") || ready=0
-        fi
-    fi
-    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
-        [[ -n "${EXTERNAL_REALITY_HOST_UUID:-}" ]] && \
-            selected_uuids+=("${EXTERNAL_REALITY_HOST_UUID}") || ready=0
-        if [[ "${ENABLE_RAW_FRAGMENT}" == 1 && "${FRAGMENT_REALITY}" == external ]]; then
-            [[ -n "${RAW_FRAGMENT_HOST_UUID:-}" ]] && selected_uuids+=("${RAW_FRAGMENT_HOST_UUID}") || ready=0
-        fi
-    fi
-    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
-        [[ -n "${XHTTP_HOST_UUID:-}" ]] && selected_uuids+=("${XHTTP_HOST_UUID}") || ready=0
-    fi
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        [[ -n "${HYSTERIA_HOST_UUID:-}" ]] && selected_uuids+=("${HYSTERIA_HOST_UUID}") || ready=0
-    fi
-    if [[ -n "${EXTRA_HOST_UUIDS:-}" ]]; then
-        IFS=',' read -r -a extra_uuids <<<"${EXTRA_HOST_UUIDS}"
-        for uuid in "${extra_uuids[@]}"; do [[ -z "${uuid}" ]] || selected_uuids+=("${uuid}"); done
-    fi
-    if [[ "${ready}" == 1 ]]; then
-        selected_json="$(printf '%s\n' "${selected_uuids[@]}" | jq -R . | jq -s .)"
-        jq --argjson selected "${selected_json}" \
-            '.remnawave.injectHosts[0].selector.values = $selected' \
-            "${output}" >"${PRIVATE_DIR}/xray-json-auto.ready.json"
-        chmod 0600 "${PRIVATE_DIR}/xray-json-auto.ready.json"
-    fi
+    install -m 0600 "${output}" "${PRIVATE_DIR}/xray-json-auto.ready.json"
 }
 
 selected_primary_inbound_tag() {
@@ -1627,7 +1571,8 @@ selected_inbound_tags_csv() {
 
 render_panel_stage_one() {
     local active_inbounds primary_tag self_section='' external_section=''
-    local xhttp_section='' hysteria_section='' fragment_section='' base_tag base_name base_sni_line
+    local xhttp_section='' hysteria_section='' fragment_section='' migration_note=''
+    local base_tag base_name base_sni_line
     active_inbounds="$(selected_inbound_tags_csv)"
     primary_tag="$(selected_primary_inbound_tag)"
     if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
@@ -1693,12 +1638,14 @@ PHYSICAL HOST — HYSTERIA2 / UDP 443
    Inbound: ${HYSTERIA_TAG}
    Address: ${EDGE_IPV4}
    Port: 443
-   Advanced -> SNI: ${XHTTP_SNI}
+   Advanced -> SNI: leave empty (inherits ${XHTTP_SNI} from the inbound)
    Advanced -> Security Layer: TLS
    Advanced -> Fingerprint: ${CLIENT_FINGERPRINT}
    Advanced -> ALPN: h3
-   Advanced -> Pinned Peer Certificate SHA256: ${HYSTERIA_CERT_SHA256}
-   Leave Host, Path, Mux, SockOpt and FinalMask empty/default.
+   Advanced -> Pinned Peer Certificate SHA256: leave empty
+   Leave Host, Path, Mux, SockOpt and FinalMask empty/default. Caddy supplies
+   a publicly trusted Let's Encrypt certificate, so allowInsecure and pinning
+   must remain disabled.
    Host Visibility: ON
    Hide Host: ON
    Exclude formats: XRAY_JSON
@@ -1706,6 +1653,17 @@ PHYSICAL HOST — HYSTERIA2 / UDP 443
    Nodes: optional visual metadata
 
    Do not enable allowInsecure. UDP hopping and Salamander stay off."
+        if [[ -d "${PRIVATE_DIR}/hysteria-tls" ]]; then
+            migration_note="
+UPGRADE FROM THE LEGACY SELF-SIGNED HY2 BUILD
+   Do not save the new Config Profile first. Run the node stage once while the
+   old profile is still active; it mounts both the old compatibility directory
+   and Caddy storage, so current sessions can recover after recreation. Then
+   replace the Config Profile with config-profile.ready.json, wait for Node/Xray
+   to return online, clear the Host certificate pin, refresh the subscription,
+   and run verify plus verify-auth. The old directory is no longer referenced
+   by the new profile and may be removed only after that canary succeeds."
+        fi
     fi
     if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
         if [[ "${FRAGMENT_REALITY}" == external ]]; then
@@ -1737,6 +1695,7 @@ PHYSICAL HOST — REALITY ${base_name} / CLIENT FRAGMENT A/B
     cat >"${PRIVATE_DIR}/PANEL-STAGE-1.txt" <<EOF
 REMNAWAVE PANEL 2.8.1 — STAGE 1
 ================================
+${migration_note}
 
 1. CONFIG PROFILE
    Config Profiles -> Create
@@ -1772,11 +1731,10 @@ ${fragment_section}
 ${xhttp_section}
 ${hysteria_section}
 
-Save every physical Host and copy HOST UUID values (not user/inbound UUIDs),
-then run: sudo bash <this-script> template
+Save every physical Host, then run: sudo bash <this-script> template
 
 For every physical Host, XRAY_JSON exclusion is mandatory even though the Host
-is hidden. Backend 2.8.1 still allows the UUID injector to consume a hidden,
+is hidden. Backend 2.8.1 still allows the injector to consume a hidden,
 XRAY_JSON-excluded Host; the exclusion prevents accidental standalone JSON
 output if visibility is changed later. Exclusion is a Host field, not an
 inbound field.
@@ -1790,33 +1748,17 @@ EOF
 }
 
 render_panel_stage_two() {
-    local primary_tag physical_count=0 uuid_lines=''
+    local primary_tag physical_count=0
     primary_tag="$(selected_primary_inbound_tag)"
-    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
-        [[ -n "${RAW_HOST_UUID:-}" ]] || return 0
-        uuid_lines+="Self-SNI REALITY Host UUID: ${RAW_HOST_UUID}\n"; physical_count=$((physical_count + 1))
-    fi
-    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
-        [[ -n "${EXTERNAL_REALITY_HOST_UUID:-}" ]] || return 0
-        uuid_lines+="External REALITY Host UUID: ${EXTERNAL_REALITY_HOST_UUID}\n"; physical_count=$((physical_count + 1))
-    fi
-    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        [[ -n "${RAW_FRAGMENT_HOST_UUID:-}" ]] || return 0
-        uuid_lines+="REALITY Fragment Host UUID: ${RAW_FRAGMENT_HOST_UUID}\n"; physical_count=$((physical_count + 1))
-    fi
-    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
-        [[ -n "${XHTTP_HOST_UUID:-}" ]] || return 0
-        uuid_lines+="XHTTP Host UUID: ${XHTTP_HOST_UUID}\n"; physical_count=$((physical_count + 1))
-    fi
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        [[ -n "${HYSTERIA_HOST_UUID:-}" ]] || return 0
-        uuid_lines+="Hysteria2 Host UUID: ${HYSTERIA_HOST_UUID}\n"; physical_count=$((physical_count + 1))
-    fi
+    ((physical_count += ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA))
+    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || ((physical_count += 1))
     cat >"${PRIVATE_DIR}/PANEL-STAGE-2.txt" <<EOF
 REMNAWAVE PANEL 2.8.1 — STAGE 2
 ================================
 
-$(printf '%b' "${uuid_lines}")Additional physical Host UUIDs: ${EXTRA_HOST_UUIDS:-none}
+The AUTO template selects hidden physical Hosts whose Remark starts with
+"RW ${NODE_CODE} REALITY", "RW ${NODE_CODE} XHTTP" or "RW ${NODE_CODE} HY2".
+No Host UUID input is required.
 
 1. XRAY_JSON TEMPLATE
    Create template: RW-${NODE_CODE}-AUTO
@@ -1837,8 +1779,9 @@ $(printf '%b' "${uuid_lines}")Additional physical Host UUIDs: ${EXTRA_HOST_UUIDS
    Exclude formats: every format except XRAY_JSON
    Keep production squads excluded during canary.
 
-   Do not inject AUTO Host UUID. Only the ${physical_count} physical UUIDs above
-   and explicitly supplied cross-node UUIDs belong in injectHosts.
+   AUTO is visible, so it cannot match the hidden-only injector. Expected match
+   count: ${physical_count}. Do not reuse this exact Remark prefix for unrelated
+   hidden Hosts.
 
 3. SUBSCRIPTION
    Enable Serve JSON at base subscription. Keep built-in Response Rules and
@@ -2009,13 +1952,13 @@ validate_auto_template_model() {
     fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
         if ((index == 1)); then tag='proxy'; else tag="proxy-${index}"; fi
-        jq --arg tag "${tag}" --arg uuid "${test_uuid}" --arg pin "${HYSTERIA_CERT_SHA256}" \
-            --arg fingerprint "${CLIENT_FINGERPRINT}" '
+        jq --arg tag "${tag}" --arg uuid "${test_uuid}" \
+            --arg server_name "${XHTTP_SNI}" --arg fingerprint "${CLIENT_FINGERPRINT}" '
           .outbounds += [{
             tag: $tag, protocol: "hysteria", settings: {address: "127.0.0.1", port: 443, version: 2},
             streamSettings: {network: "hysteria", security: "tls",
-              tlsSettings: {serverName: "reality.example.com", fingerprint: $fingerprint,
-                alpn: ["h3"], pinnedPeerCertSha256: $pin},
+              tlsSettings: {serverName: $server_name, fingerprint: $fingerprint,
+                alpn: ["h3"]},
               hysteriaSettings: {version: 2, auth: $uuid}}
           }]
         ' "${config}" >"${tmp}"
@@ -2037,8 +1980,9 @@ validate_auto_template_model() {
 }
 
 validate_artifacts() {
-    local caddy_output caddy_json node_compose_json edge_compose_json expected_inbounds=0 expected_hosts=0
-    local -a caddy_subjects=("${REALITY_SNI}") xray_server_mounts=()
+    local caddy_output caddy_json node_compose_json edge_compose_json xray_validation_config=''
+    local expected_inbounds=0 expected_hosts=0
+    local -a caddy_subjects=("${REALITY_SNI}") xray_server_mounts=() material=()
     log 'Validating strict JSON, pinned Xray, Compose, HAProxy and Caddy...'
     jq empty "${PRIVATE_DIR}/config-profile.ready.json"
     jq empty "${PRIVATE_DIR}/xray-json-auto.template.json"
@@ -2109,50 +2053,72 @@ validate_artifacts() {
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
         jq -e --arg tag "${HYSTERIA_TAG}" --argjson port 443 \
           --arg masq "http://127.0.0.1:${HYSTERIA_MASQ_PORT}" \
-          --arg cert_path "${HYSTERIA_CERT_CONTAINER_DIR}/server.crt" \
-          --arg key_path "${HYSTERIA_CERT_CONTAINER_DIR}/server.key" '
+          --arg server_name "${XHTTP_SNI}" \
+          --arg cert_path "$(hysteria_cert_container_path)" \
+          --arg key_path "$(hysteria_key_container_path)" '
           [.inbounds[] | select(
             .tag == $tag and .listen == "0.0.0.0" and .port == $port and
             .protocol == "hysteria" and .settings.version == 2 and
             .streamSettings.security == "tls" and
             .streamSettings.hysteriaSettings.masquerade.url == $masq and
+            .streamSettings.tlsSettings.serverName == $server_name and
             .streamSettings.tlsSettings.certificates == [{
-              certificateFile: $cert_path, keyFile: $key_path
+              certificateFile: $cert_path, keyFile: $key_path, oneTimeLoading: false
             }] and
             ([.streamSettings.tlsSettings.certificates[] |
               has("certificate") or has("key")] | any | not)
           )] | length == 1
         ' "${PRIVATE_DIR}/config-profile.ready.json" >/dev/null || \
-            die 'Hysteria2 inbound lost its UDP/443, mounted-certificate, or masquerade contract.'
-        xray_server_mounts=(
-            -v "${PRIVATE_DIR}/hysteria-tls:${HYSTERIA_CERT_CONTAINER_DIR}:ro"
-        )
+            die 'Hysteria2 inbound lost its UDP/443, Caddy-certificate, SNI, or masquerade contract.'
+        if caddy_hysteria_material_paths >/dev/null 2>&1; then
+            mapfile -t material < <(caddy_hysteria_material_paths)
+            if ((${#material[@]} == 2)) && \
+               [[ -s "${material[0]}" && -s "${material[1]}" ]]; then
+                xray_server_mounts=(
+                    -v "$(caddy_volume_name):${CADDY_DATA_CONTAINER_DIR}:ro"
+                )
+            fi
+        fi
     fi
 
     [[ "$(grep -Fc 'Exclude formats: XRAY_JSON' "${PRIVATE_DIR}/PANEL-STAGE-1.txt")" \
         == "${expected_hosts}" ]] || \
         die 'Panel guide does not exclude every physical Host from standalone XRAY_JSON output.'
 
-    jq -e --argjson expected "${expected_hosts}" '
+    jq -e '
       .remnawave.injectHosts[0].selectFrom == "HIDDEN" and
-      (.remnawave.injectHosts[0].selector.values | length == $expected) and
+      .remnawave.injectHosts[0].selector.type == "remarkRegex" and
+      (.remnawave.injectHosts[0].selector.pattern | startswith("^RW ")) and
       .routing.balancers[0].strategy.type == "leastPing" and
       (.dns.servers | length == 3) and
       (.dns.servers[0].address | startswith("https://")) and
       (.dns.servers[1].address | startswith("https://")) and
       .dns.servers[2].address == "fakedns"
     ' "${PRIVATE_DIR}/xray-json-auto.template.json" >/dev/null || \
-        die 'AUTO template lost its hidden-Host, leastPing or DoH-only contract.'
+        die 'AUTO template lost its hidden Remark selector, leastPing or DoH-only contract.'
 
-    docker run --rm --pull never --network none --cap-drop ALL --read-only \
-        "${xray_server_mounts[@]}" \
-        -v "${PRIVATE_DIR}/config-profile.ready.json:/etc/xray/config.json:ro" \
-        --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" \
-        run -test -config /etc/xray/config.json >/dev/null
-
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        validate_hysteria_material
+    if [[ "${ENABLE_HYSTERIA}" == 1 && ${#xray_server_mounts[@]} -eq 0 ]]; then
+        # Before the first public ACME issuance there is deliberately no local
+        # fallback certificate. Validate every other inbound now; node_stage
+        # obtains and validates the trusted certificate before its final full
+        # Xray test and before starting the Node container.
+        xray_validation_config="$(mktemp "${PRIVATE_DIR}/.xray-pre-acme.XXXXXX")"
+        jq --arg tag "${HYSTERIA_TAG}" 'del(.inbounds[] | select(.tag == $tag))' \
+            "${PRIVATE_DIR}/config-profile.ready.json" >"${xray_validation_config}"
+    else
+        xray_validation_config="${PRIVATE_DIR}/config-profile.ready.json"
     fi
+    if ! docker run --rm --pull never --network none --cap-drop ALL --read-only \
+        "${xray_server_mounts[@]}" \
+        -v "${xray_validation_config}:/etc/xray/config.json:ro" \
+        --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" \
+        run -test -config /etc/xray/config.json >/dev/null; then
+        [[ "${xray_validation_config}" == "${PRIVATE_DIR}/config-profile.ready.json" ]] || \
+            find "${xray_validation_config}" -maxdepth 0 -delete
+        die 'Pinned Xray rejected the generated server profile.'
+    fi
+    [[ "${xray_validation_config}" == "${PRIVATE_DIR}/config-profile.ready.json" ]] || \
+        find "${xray_validation_config}" -maxdepth 0 -delete
 
     validate_auto_template_model "${PRIVATE_DIR}/xray-json-auto.template.json"
     docker compose --env-file "${PRIVATE_DIR}/edge.env" \
@@ -2163,17 +2129,21 @@ validate_artifacts() {
     node_compose_json="$(docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" \
         config --format json)"
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        jq -e --arg target "${HYSTERIA_CERT_CONTAINER_DIR}" '
-          [.services.node.volumes[] | select(
-            .type == "bind" and .target == $target and .read_only == true
-          )] | length == 1
+        jq -e --arg target "${CADDY_DATA_CONTAINER_DIR}" \
+          --arg volume_name "$(caddy_volume_name)" '
+          ([.services.node.volumes[] | select(
+            .type == "volume" and .source == "caddy_data" and
+            .target == $target and .read_only == true
+          )] | length == 1) and
+          .volumes.caddy_data.external == true and
+          .volumes.caddy_data.name == $volume_name
         ' <<<"${node_compose_json}" >/dev/null || \
-            die 'Node Compose lost the read-only Hysteria certificate bind mount.'
+            die 'Node Compose lost the read-only Caddy certificate volume.'
     else
-        jq -e --arg target "${HYSTERIA_CERT_CONTAINER_DIR}" '
+        jq -e --arg target "${CADDY_DATA_CONTAINER_DIR}" '
           [(.services.node.volumes // [])[] | select(.target == $target)] | length == 0
         ' <<<"${node_compose_json}" >/dev/null || \
-            die 'Node Compose unexpectedly mounts Hysteria certificates while transport is disabled.'
+            die 'Node Compose unexpectedly mounts Caddy storage while Hysteria2 is disabled.'
     fi
     jq -e '
       .services.node.cpu_shares == 2048 and
@@ -2213,10 +2183,16 @@ validate_artifacts() {
         -v "${INSTALL_DIR}/site:/srv:ro" \
         "${CADDY_IMAGE}" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null)"
     jq -e --argjson subjects "$(printf '%s\n' "${caddy_subjects[@]}" | jq -R . | jq -s .)" '
-      ([.apps.tls.automation.policies[].issuers[] |
-        select(.module == "acme" and .challenges.http.disabled == true and
-        .challenges."tls-alpn".alternate_port == 19443)] | length == 1) and
-      (([.apps.tls.automation.policies[].subjects[]] | unique | sort) == ($subjects | unique | sort)) and
+      ([.apps.tls.automation.policies[].issuers[]?]) as $issuers |
+      (($issuers | length) >= 1) and
+      (all($issuers[];
+        .module == "acme" and
+        .ca == "https://acme-v02.api.letsencrypt.org/directory" and
+        .challenges.http.disabled == true and
+        .challenges."tls-alpn".alternate_port == 19443)) and
+      (([.apps.http.servers[].routes[]?.match[]?.host[]? |
+          select(. != "127.0.0.1")] | unique | sort) ==
+        ($subjects | unique | sort)) and
       ([.apps.http.servers[].listen[]] | index("127.0.0.1:19443") != null) and
       ([.apps.http.servers[].listen[]] | index("0.0.0.0:19443") == null)
     ' <<<"${caddy_json}" >/dev/null || \
@@ -2464,7 +2440,7 @@ apply_firewall() {
            ((10#${ssh_port} < 1 || 10#${ssh_port} > 65535)); then
             die "Could not determine a safe SSH port; set RW_SSH_PORT."
         fi
-        if [[ "${RW_ENABLE_UFW:-0}" != 1 ]]; then
+        if [[ "${RW_ENABLE_UFW:-1}" != 1 ]]; then
             if [[ "${NON_INTERACTIVE}" == 1 || ! -t 0 ]]; then
                 die 'UFW is inactive. Set RW_ENABLE_UFW=1 after confirming RW_SSH_PORT, or enable it manually.'
             fi
@@ -2495,11 +2471,29 @@ apply_firewall() {
     '; then
         broad=1
     fi
-    if ((broad == 1)) && [[ "${RW_ACCEPT_BROAD_CONTROL:-0}" != 1 ]]; then
-        die "A broad UFW allow already exposes Node port ${NODE_PORT}. Remove it or set RW_ACCEPT_BROAD_CONTROL=1 temporarily."
-    fi
-
     ufw allow proto tcp from "${PANEL_IPV4}" to any port "${NODE_PORT}" comment "Remnawave Panel ${NODE_CODE}" >/dev/null
+    if ((broad == 1)); then
+        warn "Replacing the broad Node API rule on ${NODE_PORT} with the verified Panel-IP allow."
+        for _ in 1 2 3 4; do
+            if ufw status | awk -v p="${NODE_PORT}" '
+                ($1 == p || $1 == p"/tcp") && $2 == "ALLOW" &&
+                ($0 ~ /Anywhere/ || $0 ~ /0\.0\.0\.0\/0/ || $0 ~ /::\/0/) {found=1}
+                END {exit !found}
+            '; then
+                ufw --force delete allow "${NODE_PORT}/tcp" >/dev/null 2>&1 || \
+                    ufw --force delete allow "${NODE_PORT}" >/dev/null
+            else
+                break
+            fi
+        done
+        if ufw status | awk -v p="${NODE_PORT}" '
+            ($1 == p || $1 == p"/tcp") && $2 == "ALLOW" &&
+            ($0 ~ /Anywhere/ || $0 ~ /0\.0\.0\.0\/0/ || $0 ~ /::\/0/) {found=1}
+            END {exit !found}
+        '; then
+            die "Could not automatically remove every broad Node API rule on ${NODE_PORT}."
+        fi
+    fi
     ufw allow 443/tcp comment "Remnawave edge ${NODE_CODE}" >/dev/null
     [[ "${ENABLE_HYSTERIA}" != 1 ]] || \
         ufw allow 443/udp comment "Remnawave Hysteria2 ${NODE_CODE}" >/dev/null
@@ -2585,10 +2579,6 @@ validate_loaded_state() {
     [[ "${BLOCK_CLIENT_QUIC}" =~ ^[01]$ ]] || die 'Invalid BLOCK_CLIENT_QUIC in state.'
     [[ "${APPLY_TUNING}" =~ ^[01]$ ]] || die 'Invalid APPLY_TUNING in state.'
     validate_fingerprint "${CLIENT_FINGERPRINT}" || die 'Invalid CLIENT_FINGERPRINT in state.'
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        [[ "${HYSTERIA_CERT_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || die 'Invalid Hysteria certificate pin in state.'
-        validate_hysteria_material
-    fi
 }
 
 show_configuration_summary() {
@@ -2618,7 +2608,6 @@ show_configuration_summary() {
     ui_kv 'Fragment A/B Host' "${fragment_status}"
     ui_kv 'Inner QUIC block' "${quic_status}"
     ui_kv 'Reversible tuning' "${tuning_status}"
-    confirm_continue
 }
 
 init_stage() {
@@ -2637,6 +2626,9 @@ init_stage() {
                 die 'Saved external REALITY target no longer passes DNS/TLS/Xray validation.'
         fi
         render_validate_transaction
+        # Re-serialize older protected state so legacy self-signed HY2 pin
+        # fields disappear after a successful artifact migration.
+        write_state
         log "Existing protected state and every generated artifact were rebuilt and validated."
         return 0
     fi
@@ -2645,18 +2637,18 @@ init_stage() {
     REALITY_SNI="${RW_REALITY_SNI:-}"
     XHTTP_SNI="${RW_XHTTP_SNI:-}"
     EDGE_IPV4="${RW_EDGE_IPV4:-}"
-    PANEL_IPV4="${RW_PANEL_IPV4:-}"
-    ACME_EMAIL="${RW_ACME_EMAIL:-}"
+    PANEL_IPV4="${RW_PANEL_IPV4:-78.17.85.117}"
+    ACME_EMAIL="${RW_ACME_EMAIL:-thisaintu@proton.me}"
     NODE_PORT="${RW_NODE_PORT:-}"
     NODE_SLUG="${RW_NODE_NAME:-}"
     ENABLE_SELF_REALITY="${RW_ENABLE_SELF_REALITY:-}"
     ENABLE_EXTERNAL_REALITY="${RW_ENABLE_EXTERNAL_REALITY:-}"
     ENABLE_XHTTP="${RW_ENABLE_XHTTP:-}"
     ENABLE_HYSTERIA="${RW_ENABLE_HYSTERIA:-}"
-    ENABLE_RAW_FRAGMENT="${RW_ENABLE_RAW_FRAGMENT:-}"
-    FRAGMENT_REALITY="${RW_FRAGMENT_REALITY:-}"
-    BLOCK_CLIENT_QUIC="${RW_BLOCK_CLIENT_QUIC:-}"
-    APPLY_TUNING="${RW_APPLY_TUNING:-}"
+    ENABLE_RAW_FRAGMENT="${RW_ENABLE_RAW_FRAGMENT:-0}"
+    FRAGMENT_REALITY="${RW_FRAGMENT_REALITY:-self}"
+    BLOCK_CLIENT_QUIC="${RW_BLOCK_CLIENT_QUIC:-1}"
+    APPLY_TUNING="${RW_APPLY_TUNING:-1}"
     CLIENT_FINGERPRINT="${RW_CLIENT_FINGERPRINT:-firefox}"
     ui_section 'Transport selection' 'each enabled transport gets its own inbound and physical Host'
     prompt_yes_no ENABLE_SELF_REALITY 'Enable RAW/TCP + REALITY self-SNI?' 1
@@ -2668,9 +2660,7 @@ init_stage() {
         die 'Transport selections must be 0 or 1.'
     ((ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA > 0)) || \
         die 'Select at least one transport.'
-    if [[ "${ENABLE_SELF_REALITY}" == 1 || "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
-        prompt_yes_no ENABLE_RAW_FRAGMENT 'Generate one isolated client-fragment A/B Host?' 0
-    else
+    if [[ "${ENABLE_SELF_REALITY}" != 1 && "${ENABLE_EXTERNAL_REALITY}" != 1 ]]; then
         ENABLE_RAW_FRAGMENT=0
     fi
     if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
@@ -2691,17 +2681,12 @@ init_stage() {
         XHTTP_SNI="${REALITY_SNI}"
     fi
     prompt_value EDGE_IPV4 'Public IPv4 of this Node' "${detected_ip}"
-    prompt_value PANEL_IPV4 'Observed public/NAT egress IPv4 of Remnawave Panel'
-    prompt_value ACME_EMAIL 'Email for ACME certificate notices'
     prompt_value NODE_PORT 'Node API port (Panel control plane only)' '3334'
-    default_node_name="$(hostname -s 2>/dev/null | tr '[:upper:]_' '[:lower:]-' | \
+    default_node_name="${REALITY_SNI%%.*}"
+    default_node_name="$(printf '%s' "${default_node_name}" | tr '[:upper:]_' '[:lower:]-' | \
         tr -cd 'a-z0-9-' | cut -c1-24)"
     default_node_name="${default_node_name:-edge-node}"
-    prompt_value NODE_SLUG 'Short Node name (for example jade-noda)' "${default_node_name}"
-    prompt_yes_no BLOCK_CLIENT_QUIC \
-        'Block inner client QUIC/UDP443 for the stable RU profile?' 1
-    prompt_yes_no APPLY_TUNING \
-        'Apply reversible BBR/queue/UDP tuning during the Node stage?' 1
+    NODE_SLUG="${NODE_SLUG:-${default_node_name}}"
     REALITY_SNI="${REALITY_SNI,,}"
     XHTTP_SNI="${XHTTP_SNI,,}"
     CLIENT_FINGERPRINT="${CLIENT_FINGERPRINT,,}"
@@ -2757,7 +2742,6 @@ init_stage() {
     fi
     show_configuration_summary
     generate_material
-    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then generate_hysteria_certificate; fi
     render_validate_transaction
     write_state
     success "Initialization complete in ${INSTALL_DIR}."
@@ -2864,17 +2848,64 @@ wait_for_node_ready() {
     die "Node did not become Panel-managed within 180 seconds. Resume with: sudo ${INSTALL_DIR}/remnawave-edge-oneclick.sh node"
 }
 
+ensure_caddy_certificates() {
+    [[ "${ENABLE_HYSTERIA}" == 1 ]] || return 0
+    check_dns
+    assert_port_free_or_owned 443 "${HAPROXY_CONTAINER}"
+    assert_port_free_or_owned "${CADDY_BACKEND_PORT}" "${CADDY_CONTAINER}"
+    assert_port_free_or_owned "${HYSTERIA_MASQ_PORT}" "${CADDY_CONTAINER}"
+    assert_port_free_or_owned "${HAPROXY_STATS_PORT}" "${HAPROXY_CONTAINER}"
+
+    if ! container_is_running "${HAPROXY_CONTAINER}"; then
+        STAGE_STOP_HAPROXY=1
+        log 'Starting HAProxy so Caddy can complete public TLS-ALPN validation...'
+        docker compose --env-file "${PRIVATE_DIR}/edge.env" \
+            -f "${INSTALL_DIR}/docker-compose.edge.yml" up -d haproxy
+    fi
+    wait_for_owned_tcp_listener 443 "${HAPROXY_CONTAINER}" || \
+        die 'HAProxy did not bind public TCP/443 within 10 seconds.'
+
+    if ! container_is_running "${CADDY_CONTAINER}"; then
+        STAGE_STOP_CADDY=1
+        log 'Starting Caddy to issue publicly trusted certificates before Node/Xray...'
+        docker compose --env-file "${PRIVATE_DIR}/edge.env" \
+            -f "${INSTALL_DIR}/docker-compose.edge.yml" up -d caddy
+    else
+        log 'Reloading the validated Caddyfile before checking ACME material...'
+        docker exec "${CADDY_CONTAINER}" caddy reload \
+            --config /etc/caddy/Caddyfile --adapter caddyfile \
+            --address unix//run/caddy-admin.sock --force >/dev/null
+    fi
+    wait_for_caddy_tls "${REALITY_SNI}" || {
+        docker logs --tail 80 "${CADDY_CONTAINER}" >&2 || true
+        die "Caddy did not obtain trusted HTTPS for ${REALITY_SNI}."
+    }
+    if [[ "${XHTTP_SNI}" != "${REALITY_SNI}" ]]; then
+        wait_for_caddy_tls "${XHTTP_SNI}" || {
+            docker logs --tail 80 "${CADDY_CONTAINER}" >&2 || true
+            die "Caddy did not obtain trusted HTTPS for ${XHTTP_SNI}."
+        }
+    fi
+    validate_hysteria_material
+    success "Caddy certificate for Hysteria2 (${XHTTP_SNI}) is public, current and key-matched."
+}
+
 check_negative_mtls() {
-    local code tls_probe
-    code="$(curl --silent --show-error --connect-timeout 5 --max-time 8 \
+    local attempt code curl_probe tls_probe
+    curl_probe="$(curl --silent --show-error --connect-timeout 5 --max-time 8 \
         --insecure --output /dev/null --write-out '%{http_code}' \
-        "https://127.0.0.1:${NODE_PORT}/" 2>/dev/null || true)"
+        "https://127.0.0.1:${NODE_PORT}/" 2>&1 || true)"
+    code="$(grep -Eo '[0-9]{3}$' <<<"${curl_probe}" || true)"
     [[ "${code}" == 000 || -z "${code}" ]] || \
         die "Node API unexpectedly answered unauthenticated HTTPS with HTTP ${code}."
-    tls_probe="$(timeout 8 openssl s_client -connect "127.0.0.1:${NODE_PORT}" \
-        -tls1_3 -brief </dev/null 2>&1 || true)"
-    grep -Eqi 'tlsv13 alert certificate required|alert number 116' <<<"${tls_probe}" || \
-        die 'Node API did not prove mandatory client-certificate rejection over TLS 1.3.'
+    if grep -Eqi 'certificate required|alert number 116' <<<"${curl_probe}"; then return 0; fi
+    for attempt in 1 2 3 4 5; do
+        tls_probe="$(timeout 8 openssl s_client -connect "127.0.0.1:${NODE_PORT}" \
+            -tls1_3 -brief </dev/null 2>&1 || true)"
+        if grep -Eqi 'certificate required|alert number 116' <<<"${tls_probe}"; then return 0; fi
+        sleep 0.5
+    done
+    die 'Node API did not prove mandatory client-certificate rejection over TLS 1.3.'
 }
 
 apply_tuning_loaded() {
@@ -3019,6 +3050,16 @@ node_stage() {
         die 'UDP/443 is occupied by another service.'
     fi
     container_is_running "${NODE_CONTAINER}" && node_was_running=1
+    arm_stage_rollback node
+    apply_firewall
+    if [[ "${APPLY_TUNING}" == 1 && "${node_was_running}" != 1 ]]; then
+        apply_tuning_loaded
+    fi
+    ensure_caddy_certificates
+    # The initial init validation deliberately omits HY2 until ACME material
+    # exists. This second transaction validates the complete profile against
+    # the pinned Xray with Caddy's real read-only certificate volume mounted.
+    render_validate_transaction
     if [[ "${node_was_running}" == 1 ]]; then
         node_id_before="$(docker inspect -f '{{.Id}}' "${NODE_CONTAINER}")"
         docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" up -d node
@@ -3029,8 +3070,8 @@ node_stage() {
             node_reconciled=1
         fi
         if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-            container_has_readonly_mount "${NODE_CONTAINER}" "${HYSTERIA_CERT_CONTAINER_DIR}" || \
-                die 'Node container is missing the required read-only Hysteria certificate mount.'
+            container_has_readonly_mount "${NODE_CONTAINER}" "${CADDY_DATA_CONTAINER_DIR}" || \
+                die 'Node container is missing the required read-only Caddy certificate volume.'
         fi
         port_is_listening "${NODE_PORT}" || die 'Existing managed Node has no API listener.'
         [[ "${ENABLE_SELF_REALITY}" != 1 ]] || port_is_listening "${RAW_BACKEND_PORT}" || \
@@ -3048,11 +3089,9 @@ node_stage() {
         else
             log 'Existing managed Node passed control-plane and runtime-contract checks; it was not recreated.'
         fi
+        commit_stage
         return 0
     fi
-    arm_stage_rollback node
-    apply_firewall
-    if [[ "${APPLY_TUNING}" == 1 ]]; then apply_tuning_loaded; fi
     save_node_secret
     [[ "${node_was_running}" == 1 ]] || STAGE_STOP_NODE=1
     docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" up -d
@@ -3064,61 +3103,17 @@ node_stage() {
 }
 
 template_stage() {
-    local uuid normalized name
-    local -a extra normalized_extra selected_values
-    local -A seen=()
     announce_stage template
     require_root
     load_state
     validate_loaded_state
-    RAW_HOST_UUID="${RW_RAW_HOST_UUID:-${RAW_HOST_UUID:-}}"
-    EXTERNAL_REALITY_HOST_UUID="${RW_EXTERNAL_REALITY_HOST_UUID:-${EXTERNAL_REALITY_HOST_UUID:-}}"
-    RAW_FRAGMENT_HOST_UUID="${RW_RAW_FRAGMENT_HOST_UUID:-${RAW_FRAGMENT_HOST_UUID:-}}"
-    XHTTP_HOST_UUID="${RW_XHTTP_HOST_UUID:-${XHTTP_HOST_UUID:-}}"
-    HYSTERIA_HOST_UUID="${RW_HYSTERIA_HOST_UUID:-${HYSTERIA_HOST_UUID:-}}"
-    EXTRA_HOST_UUIDS="${RW_EXTRA_HOST_UUIDS:-${EXTRA_HOST_UUIDS:-}}"
-    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || prompt_value RAW_HOST_UUID 'Self-SNI REALITY physical Host UUID'
-    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || \
-        prompt_value EXTERNAL_REALITY_HOST_UUID 'External REALITY physical Host UUID'
-    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || \
-        prompt_value RAW_FRAGMENT_HOST_UUID "${FRAGMENT_REALITY} REALITY Fragment physical Host UUID"
-    [[ "${ENABLE_XHTTP}" != 1 ]] || prompt_value XHTTP_HOST_UUID 'XHTTP physical Host UUID'
-    [[ "${ENABLE_HYSTERIA}" != 1 ]] || prompt_value HYSTERIA_HOST_UUID 'Hysteria2 physical Host UUID'
-
-    selected_values=()
-    [[ "${ENABLE_SELF_REALITY}" != 1 ]] || selected_values+=("RAW_HOST_UUID")
-    [[ "${ENABLE_EXTERNAL_REALITY}" != 1 ]] || selected_values+=("EXTERNAL_REALITY_HOST_UUID")
-    [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || selected_values+=("RAW_FRAGMENT_HOST_UUID")
-    [[ "${ENABLE_XHTTP}" != 1 ]] || selected_values+=("XHTTP_HOST_UUID")
-    [[ "${ENABLE_HYSTERIA}" != 1 ]] || selected_values+=("HYSTERIA_HOST_UUID")
-    for name in "${selected_values[@]}"; do
-        uuid="${!name}"
-        validate_uuid "${uuid}" || die "Invalid selected physical Host UUID (${name})."
-        normalized="${uuid,,}"
-        [[ -z "${seen[${normalized}]:-}" ]] || die 'Selected physical Host UUIDs must be unique.'
-        seen["${normalized}"]=1
-        printf -v "${name}" '%s' "${normalized}"
-    done
-    if [[ -n "${EXTRA_HOST_UUIDS}" ]]; then
-        IFS=',' read -r -a extra <<<"${EXTRA_HOST_UUIDS}"
-        for uuid in "${extra[@]}"; do
-            uuid="${uuid//[[:space:]]/}"
-            validate_uuid "${uuid}" || die "Invalid extra Host UUID: ${uuid}"
-            uuid="${uuid,,}"
-            [[ -z "${seen[${uuid}]:-}" ]] || die "Duplicate Host UUID: ${uuid}"
-            seen["${uuid}"]=1
-            normalized_extra+=("${uuid}")
-        done
-        EXTRA_HOST_UUIDS="$(IFS=,; printf '%s' "${normalized_extra[*]}")"
-    fi
     render_happ_rules
     render_auto_template
     render_panel_stage_two
     [[ -s "${PRIVATE_DIR}/xray-json-auto.ready.json" ]] || die 'AUTO template was not rendered.'
     jq empty "${PRIVATE_DIR}/xray-json-auto.ready.json"
     validate_auto_template_model "${PRIVATE_DIR}/xray-json-auto.ready.json"
-    write_state
-    success 'XRAY_JSON AUTO template rendered and validated.'
+    success 'XRAY_JSON AUTO template rendered and validated without UUID input.'
     ui_file 'Ready template' "${PRIVATE_DIR}/xray-json-auto.ready.json"
     ui_file 'Exact Panel steps' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
     if [[ "${SHOW_VALUES}" == 1 ]]; then sed -n '1,240p' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"; fi
@@ -3130,6 +3125,19 @@ wait_for_public_tls() {
         if curl --silent --show-error --fail --noproxy '*' --max-time 10 \
             --resolve "${domain}:443:${EDGE_IPV4}" \
             "https://${domain}/health.txt" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+wait_for_caddy_tls() {
+    local domain="$1" attempt
+    for attempt in $(seq 1 90); do
+        if curl --silent --show-error --fail --noproxy '*' --max-time 10 \
+            --resolve "${domain}:${CADDY_BACKEND_PORT}:127.0.0.1" \
+            "https://${domain}:${CADDY_BACKEND_PORT}/health.txt" >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -3315,6 +3323,9 @@ verify_stage() {
         udp_port_is_listening 443 || die 'Hysteria2 UDP/443 is not listening.'
         udp_port_owned_by_container 443 "${NODE_CONTAINER}" || \
             die 'UDP/443 is not owned by the managed Node container.'
+        container_has_readonly_mount "${NODE_CONTAINER}" "${CADDY_DATA_CONTAINER_DIR}" || \
+            die 'Node does not have Caddy certificate storage mounted read-only.'
+        validate_hysteria_material
     else
         ! udp_port_is_listening 443 || die 'UDP/443 unexpectedly listens.'
     fi
@@ -3426,7 +3437,7 @@ render_auth_clients() {
             '.inbounds[] | select(.tag == $tag) | .settings.clients[0].auth // empty' "${runtime}")"
         validate_uuid "${hysteria_auth}" || die 'No active user credential was injected into Hysteria2 inbound.'
         jq -n --arg address "${EDGE_IPV4}" --arg auth "${hysteria_auth}" \
-            --arg server_name "${XHTTP_SNI}" --arg pin "${HYSTERIA_CERT_SHA256}" \
+            --arg server_name "${XHTTP_SNI}" \
             --arg fingerprint "${CLIENT_FINGERPRINT}" \
             --argjson socks_port "${HYSTERIA_TEST_PORT}" '
           {
@@ -3441,8 +3452,7 @@ render_auth_clients() {
               streamSettings: {
                 network: "hysteria", security: "tls",
                 tlsSettings: {
-                  serverName: $server_name, fingerprint: $fingerprint, alpn: ["h3"],
-                  pinnedPeerCertSha256: $pin
+                  serverName: $server_name, fingerprint: $fingerprint, alpn: ["h3"]
                 },
                 hysteriaSettings: {version: 2, auth: $auth}
               }
@@ -3843,7 +3853,7 @@ bootstrap_stage() {
         fi
     fi
     systemctl enable --now docker
-    log 'Base tools are installed. UFW was intentionally not enabled or given an SSH policy.'
+    log 'Base tools are installed. The Node stage will preserve SSH and enable the generated UFW policy automatically.'
 }
 
 all_stage() {
@@ -3933,7 +3943,6 @@ selftest_stage() {
     EXTRA_HOST_UUIDS='33333333-3333-4333-8333-333333333333'
     pull_images
     generate_material
-    generate_hysteria_certificate
     write_state
     render_all_files
     ensure_node_env_placeholder
