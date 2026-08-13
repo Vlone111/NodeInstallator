@@ -6,7 +6,7 @@
 
 Зафиксированная совместимая база:
 
-- NodeInstallator `2026-08-13.7`;
+- NodeInstallator `2026-08-13.8`;
 - Remnawave Panel/Backend `2.8.1`;
 - Remnawave Node `2.8.0`;
 - встроенный Xray `26.6.27`;
@@ -47,6 +47,9 @@ Panel -> allowlisted Node API port -> Remnawave Node -> managed Xray
 - Xray/Caddy/HAProxy backend-порты остаются на loopback;
 - Node API разрешается только реально наблюдаемому egress IP панели;
 - мастер генерирует XRAY_JSON AUTO template для Happ/INCY;
+- host tuning включает live `fq`, BBR, MTU probing и 32 MiB TCP autotuning;
+  контейнеры используют относительные CPU weights без жёсткого CFS-потолка,
+  поэтому свободные vCPU доступны для кратковременного throughput burst;
 - изменения UFW и server tuning имеют отдельный явный rollback.
 
 ## Требования

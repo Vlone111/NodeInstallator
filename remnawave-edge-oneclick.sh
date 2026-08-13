@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-13.7'
+SCRIPT_VERSION='2026-08-13.8'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -1257,9 +1257,7 @@ EOF
 }
 
 render_compose() {
-    local host_cpus node_cpus node_memory
-    host_cpus="$(nproc)"
-    if ((host_cpus >= 2)); then node_cpus='1.50'; else node_cpus='0.75'; fi
+    local node_memory
     if (( $(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) >= 3500 )); then node_memory='2g'; else node_memory='1g'; fi
 
     cat >"${INSTALL_DIR}/docker-compose.node.yml" <<EOF
@@ -1271,7 +1269,9 @@ services:
     container_name: ${NODE_CONTAINER}
     network_mode: host
     restart: unless-stopped
-    cpus: ${node_cpus}
+    # Relative weight applies only during contention; no CFS quota prevents
+    # short throughput bursts from using every vCPU exposed by the VM.
+    cpu_shares: 2048
     mem_limit: ${node_memory}
     pids_limit: 512
     env_file:
@@ -1306,7 +1306,7 @@ services:
     container_name: ${CADDY_CONTAINER}
     network_mode: host
     restart: unless-stopped
-    cpus: 0.75
+    cpu_shares: 512
     mem_limit: 384m
     pids_limit: 256
     env_file:
@@ -1344,7 +1344,7 @@ services:
     user: "0:0"
     network_mode: host
     restart: unless-stopped
-    cpus: 0.50
+    cpu_shares: 1024
     mem_limit: 256m
     pids_limit: 256
     env_file:
@@ -1409,6 +1409,8 @@ net.ipv4.tcp_max_syn_backlog = 8192
 net.core.netdev_max_backlog = 16384
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 16384 33554432
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 EOF
@@ -2030,7 +2032,7 @@ validate_auto_template_model() {
 }
 
 validate_artifacts() {
-    local caddy_output caddy_json node_compose_json expected_inbounds=0 expected_hosts=0
+    local caddy_output caddy_json node_compose_json edge_compose_json expected_inbounds=0 expected_hosts=0
     local -a caddy_subjects=("${REALITY_SNI}") xray_server_mounts=()
     log 'Validating strict JSON, pinned Xray, Compose, HAProxy and Caddy...'
     jq empty "${PRIVATE_DIR}/config-profile.ready.json"
@@ -2140,6 +2142,8 @@ validate_artifacts() {
     validate_auto_template_model "${PRIVATE_DIR}/xray-json-auto.template.json"
     docker compose --env-file "${PRIVATE_DIR}/edge.env" \
         -f "${INSTALL_DIR}/docker-compose.edge.yml" config --quiet
+    edge_compose_json="$(docker compose --env-file "${PRIVATE_DIR}/edge.env" \
+        -f "${INSTALL_DIR}/docker-compose.edge.yml" config --format json)"
     docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" config --quiet
     node_compose_json="$(docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" \
         config --format json)"
@@ -2156,6 +2160,18 @@ validate_artifacts() {
         ' <<<"${node_compose_json}" >/dev/null || \
             die 'Node Compose unexpectedly mounts Hysteria certificates while transport is disabled.'
     fi
+    jq -e '
+      .services.node.cpu_shares == 2048 and
+      ((.services.node.cpus // null) == null)
+    ' <<<"${node_compose_json}" >/dev/null || \
+        die 'Node Compose lost burst CPU policy or regained a hard CPU quota.'
+    jq -e '
+      .services.haproxy.cpu_shares == 1024 and
+      .services.caddy.cpu_shares == 512 and
+      ((.services.haproxy.cpus // null) == null) and
+      ((.services.caddy.cpus // null) == null)
+    ' <<<"${edge_compose_json}" >/dev/null || \
+        die 'Edge Compose lost weighted burst CPU policy or regained hard quotas.'
 
     docker run --rm --pull never --network none --cap-drop ALL --read-only \
         --env-file "${PRIVATE_DIR}/edge.env" \
@@ -2856,6 +2872,7 @@ apply_tuning_loaded() {
       net.ipv4.tcp_mtu_probing net.core.somaxconn
       net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog
       net.core.rmem_max net.core.wmem_max
+      net.ipv4.tcp_rmem net.ipv4.tcp_wmem
       net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min
     )
     if [[ ! -f "${snapshot}" ]]; then
@@ -2868,6 +2885,20 @@ apply_tuning_loaded() {
         [[ ! -f "${sysctl_target}" ]] || cp -a "${sysctl_target}" "${PRIVATE_DIR}/sysctl-file.before"
         [[ ! -f "${module_target}" ]] || cp -a "${module_target}" "${PRIVATE_DIR}/modules-file.before"
         STAGE_TUNING_WAS_NEW=1
+    else
+        # Upgrade an older snapshot before adding new tuning keys. Existing
+        # values remain untouched and newly managed keys keep their exact
+        # pre-upgrade values for a future untune/rollback-host operation.
+        snapshot_tmp="$(mktemp "${PRIVATE_DIR}/.sysctl-before.XXXXXX")"
+        cp -- "${snapshot}" "${snapshot_tmp}"
+        for key in "${keys[@]}"; do
+            if ! awk -F= -v wanted="${key}" '$1 == wanted {found=1} END {exit !found}' \
+                "${snapshot}"; then
+                printf '%s=%s\n' "${key}" "$(sysctl -n "${key}")" >>"${snapshot_tmp}"
+            fi
+        done
+        chmod 0600 "${snapshot_tmp}"
+        mv -f -- "${snapshot_tmp}" "${snapshot}"
     fi
     default_interface="$(ip -4 route show default | awk 'NR == 1 {print $5}')"
     [[ "${default_interface}" =~ ^[A-Za-z0-9_.:-]+$ ]] || die 'Could not determine a safe default network interface.'
@@ -2886,7 +2917,11 @@ apply_tuning_loaded() {
     tc qdisc replace dev "${default_interface}" root fq
     live_qdisc="$(tc qdisc show dev "${default_interface}" 2>/dev/null | awk 'NR == 1 {print $2}')"
     [[ "${live_qdisc}" == fq ]] || die "Could not activate fq on ${default_interface}."
-    log "Applied reversible BBR, live fq on ${default_interface}, MTU probing, backlog and UDP socket buffers."
+    [[ "$(sysctl -n net.ipv4.tcp_rmem | awk '{print $3}')" == 33554432 ]] || \
+        die 'TCP receive autotuning ceiling did not become 32 MiB.'
+    [[ "$(sysctl -n net.ipv4.tcp_wmem | awk '{print $3}')" == 33554432 ]] || \
+        die 'TCP send autotuning ceiling did not become 32 MiB.'
+    log "Applied reversible BBR, live fq on ${default_interface}, MTU probing, 32 MiB TCP autotuning, backlog and UDP buffers."
 }
 
 tune_stage() {
@@ -2949,7 +2984,7 @@ untune_stage() {
 }
 
 node_stage() {
-    local node_was_running=0 node_reconciled=0
+    local node_was_running=0 node_reconciled=0 node_id_before node_id_after
     announce_stage node
     require_root
     need_commands
@@ -2970,14 +3005,17 @@ node_stage() {
     fi
     container_is_running "${NODE_CONTAINER}" && node_was_running=1
     if [[ "${node_was_running}" == 1 ]]; then
-        if [[ "${ENABLE_HYSTERIA}" == 1 ]] && \
-           ! container_has_readonly_mount "${NODE_CONTAINER}" "${HYSTERIA_CERT_CONTAINER_DIR}"; then
-            log 'Reconciling the existing Node with the protected read-only Hysteria certificate mount...'
-            docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" up -d node
+        node_id_before="$(docker inspect -f '{{.Id}}' "${NODE_CONTAINER}")"
+        docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" up -d node
+        node_id_after="$(docker inspect -f '{{.Id}}' "${NODE_CONTAINER}")"
+        if [[ "${node_id_before}" != "${node_id_after}" ]]; then
+            log 'Node Compose drift was reconciled; waiting for Panel and Xray readiness...'
             wait_for_node_ready
-            container_has_readonly_mount "${NODE_CONTAINER}" "${HYSTERIA_CERT_CONTAINER_DIR}" || \
-                die 'Node recreation completed without the required Hysteria certificate mount.'
             node_reconciled=1
+        fi
+        if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
+            container_has_readonly_mount "${NODE_CONTAINER}" "${HYSTERIA_CERT_CONTAINER_DIR}" || \
+                die 'Node container is missing the required read-only Hysteria certificate mount.'
         fi
         port_is_listening "${NODE_PORT}" || die 'Existing managed Node has no API listener.'
         [[ "${ENABLE_SELF_REALITY}" != 1 ]] || port_is_listening "${RAW_BACKEND_PORT}" || \
@@ -3558,6 +3596,7 @@ status_stage() {
     load_state
     validate_loaded_state
     local container state restarts reality_answers xhttp_answers external_answers
+    local default_interface live_qdisc qdisc_drops tcp_rx_max tcp_tx_max hard_cpu_quotas=0 nano_cpus
     reality_answers="$(dig +short A "${REALITY_SNI}" | paste -sd, -)"
     reality_answers="${reality_answers:-unresolved}"
     if [[ "${ENABLE_XHTTP}" == 1 ]]; then
@@ -3591,6 +3630,43 @@ status_stage() {
             ui_status_row check "External ${EXTERNAL_REALITY_SNI}" \
                 "${external_answers}; must resolve away from ${EDGE_IPV4}"
         fi
+    fi
+    default_interface="$(ip -4 route show default | awk 'NR == 1 {print $5}')"
+    live_qdisc="$(tc qdisc show dev "${default_interface}" 2>/dev/null | awk 'NR == 1 {print $2}')"
+    qdisc_drops="$(tc -s qdisc show dev "${default_interface}" 2>/dev/null | \
+        sed -nE 's/.*dropped ([0-9]+).*/\1/p' | head -n 1)"
+    tcp_rx_max="$(sysctl -n net.ipv4.tcp_rmem | awk '{print $3}')"
+    tcp_tx_max="$(sysctl -n net.ipv4.tcp_wmem | awk '{print $3}')"
+    ui_section 'Host tuning' 'live kernel and scheduler state, not saved-file claims'
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == bbr ]]; then
+        ui_status_row ok 'Congestion control' 'bbr'
+    else
+        ui_status_row check 'Congestion control' "$(sysctl -n net.ipv4.tcp_congestion_control) (expected bbr)"
+    fi
+    if [[ "${live_qdisc}" == fq ]]; then
+        ui_status_row ok "Queue ${default_interface}" "fq; drops ${qdisc_drops:-unknown}"
+    else
+        ui_status_row check "Queue ${default_interface}" "${live_qdisc:-unknown} (expected fq)"
+    fi
+    if [[ "${tcp_rx_max}" == 33554432 && "${tcp_tx_max}" == 33554432 ]]; then
+        ui_status_row ok 'TCP autotuning ceilings' 'receive 32 MiB; send 32 MiB'
+    else
+        ui_status_row check 'TCP autotuning ceilings' "receive ${tcp_rx_max}; send ${tcp_tx_max}"
+    fi
+    if [[ "$(sysctl -n net.ipv4.tcp_mtu_probing)" == 1 ]]; then
+        ui_status_row ok 'TCP MTU probing' 'enabled'
+    else
+        ui_status_row check 'TCP MTU probing' 'disabled'
+    fi
+    for container in "${NODE_CONTAINER}" "${HAPROXY_CONTAINER}" "${CADDY_CONTAINER}"; do
+        nano_cpus="$(docker inspect -f '{{.HostConfig.NanoCpus}}' "${container}" 2>/dev/null || printf '0')"
+        [[ "${nano_cpus}" =~ ^[0-9]+$ ]] || nano_cpus=0
+        ((nano_cpus == 0)) || hard_cpu_quotas=$((hard_cpu_quotas + 1))
+    done
+    if ((hard_cpu_quotas == 0)); then
+        ui_status_row ok 'Container CPU policy' 'burst allowed; weighted only under contention'
+    else
+        ui_status_row check 'Container CPU policy' "${hard_cpu_quotas} hard CFS quota(s) still active"
     fi
     ui_section 'Containers' 'state and lifetime restart counter'
     for container in "${NODE_CONTAINER}" "${HAPROXY_CONTAINER}" "${CADDY_CONTAINER}"; do
