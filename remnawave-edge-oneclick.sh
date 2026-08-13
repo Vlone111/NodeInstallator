@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-13.6'
+SCRIPT_VERSION='2026-08-13.7'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -40,6 +40,7 @@ EXTERNAL_REALITY_BACKEND_PORT=18445
 CADDY_BACKEND_PORT=19443
 HAPROXY_STATS_PORT=8404
 HYSTERIA_MASQ_PORT=19080
+HYSTERIA_CERT_CONTAINER_DIR='/etc/remnawave-edge/hysteria-tls'
 RAW_TEST_PORT=21081
 XHTTP_TEST_PORT=21082
 HYSTERIA_TEST_PORT=21083
@@ -941,9 +942,9 @@ EOF
         mv -f "${PRIVATE_DIR}/config-profile.ready.json.tmp" "${PRIVATE_DIR}/config-profile.ready.json"
     fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
-        jq --rawfile cert "${PRIVATE_DIR}/hysteria-tls/server.crt" \
-            --rawfile key "${PRIVATE_DIR}/hysteria-tls/server.key" \
-            --arg tag "${HYSTERIA_TAG}" \
+        jq --arg tag "${HYSTERIA_TAG}" \
+            --arg cert_path "${HYSTERIA_CERT_CONTAINER_DIR}/server.crt" \
+            --arg key_path "${HYSTERIA_CERT_CONTAINER_DIR}/server.key" \
             --argjson masquerade_port "${HYSTERIA_MASQ_PORT}" '
           .inbounds += [
             {
@@ -958,8 +959,8 @@ EOF
                 tlsSettings: {
                   alpn: ["h3"],
                   certificates: [{
-                    certificate: ($cert | rtrimstr("\n") | split("\n")),
-                    key: ($key | rtrimstr("\n") | split("\n"))
+                    certificateFile: $cert_path,
+                    keyFile: $key_path
                   }]
                 },
                 hysteriaSettings: {
@@ -1289,6 +1290,12 @@ services:
         max-size: 10m
         max-file: "3"
 EOF
+    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
+        cat >>"${INSTALL_DIR}/docker-compose.node.yml" <<EOF
+    volumes:
+      - ./private/hysteria-tls:${HYSTERIA_CERT_CONTAINER_DIR}:ro
+EOF
+    fi
 
     cat >"${INSTALL_DIR}/docker-compose.edge.yml" <<EOF
 name: ${COMPOSE_PROJECT}
@@ -1628,6 +1635,7 @@ PHYSICAL HOST — RAW/TCP REALITY SELF-SNI
    Vless Route ID empty/default. Panel inherits self-SNI, key and shortId.
    Host Visibility: ON
    Hide Host: ON
+   Exclude formats: XRAY_JSON
    Tag: ${NODE_CODE}:REALITY:SELF (administrative only)
    Nodes: optional visual metadata"
     fi
@@ -1644,6 +1652,7 @@ PHYSICAL HOST — RAW/TCP REALITY EXTERNAL TARGET
    Vless Route ID empty/default. Panel inherits the dedicated key and shortId.
    Host Visibility: ON
    Hide Host: ON
+   Exclude formats: XRAY_JSON
    Tag: ${NODE_CODE}:REALITY:EXTERNAL (administrative only)
    Nodes: optional visual metadata
 
@@ -1666,6 +1675,7 @@ PHYSICAL HOST — VLESS XHTTP / TLS
    auto mode. Leave XHTTP Extra, Mux, SockOpt and FinalMask empty.
    Host Visibility: ON
    Hide Host: ON
+   Exclude formats: XRAY_JSON
    Tag: ${NODE_CODE}:XHTTP (administrative only)
    Nodes: optional visual metadata"
     fi
@@ -1684,6 +1694,7 @@ PHYSICAL HOST — HYSTERIA2 / UDP 443
    Leave Host, Path, Mux, SockOpt and FinalMask empty/default.
    Host Visibility: ON
    Hide Host: ON
+   Exclude formats: XRAY_JSON
    Tag: ${NODE_CODE}:HY2 (administrative only)
    Nodes: optional visual metadata
 
@@ -1711,6 +1722,7 @@ PHYSICAL HOST — REALITY ${base_name} / CLIENT FRAGMENT A/B
    Leave all other overrides empty/default.
    Host Visibility: ON
    Hide Host: ON
+   Exclude formats: XRAY_JSON
    Tag: ${NODE_CODE}:REALITY:${base_name}:FRAGMENT (administrative only)
 
    FinalMask is client-side only. Never paste it into the server profile."
@@ -1755,6 +1767,12 @@ ${hysteria_section}
 
 Save every physical Host and copy HOST UUID values (not user/inbound UUIDs),
 then run: sudo bash <this-script> template
+
+For every physical Host, XRAY_JSON exclusion is mandatory even though the Host
+is hidden. Backend 2.8.1 still allows the UUID injector to consume a hidden,
+XRAY_JSON-excluded Host; the exclusion prevents accidental standalone JSON
+output if visibility is changed later. Exclusion is a Host field, not an
+inbound field.
 
 Do not type a public key, shortId, flow or public id into a Host. Remnawave
 2.8.1 derives those values from the selected managed inbound.
@@ -2012,8 +2030,8 @@ validate_auto_template_model() {
 }
 
 validate_artifacts() {
-    local caddy_output caddy_json expected_inbounds=0 expected_hosts=0
-    local -a caddy_subjects=("${REALITY_SNI}")
+    local caddy_output caddy_json node_compose_json expected_inbounds=0 expected_hosts=0
+    local -a caddy_subjects=("${REALITY_SNI}") xray_server_mounts=()
     log 'Validating strict JSON, pinned Xray, Compose, HAProxy and Caddy...'
     jq empty "${PRIVATE_DIR}/config-profile.ready.json"
     jq empty "${PRIVATE_DIR}/xray-json-auto.template.json"
@@ -2073,16 +2091,30 @@ validate_artifacts() {
     fi
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
         jq -e --arg tag "${HYSTERIA_TAG}" --argjson port 443 \
-          --arg masq "http://127.0.0.1:${HYSTERIA_MASQ_PORT}" '
+          --arg masq "http://127.0.0.1:${HYSTERIA_MASQ_PORT}" \
+          --arg cert_path "${HYSTERIA_CERT_CONTAINER_DIR}/server.crt" \
+          --arg key_path "${HYSTERIA_CERT_CONTAINER_DIR}/server.key" '
           [.inbounds[] | select(
             .tag == $tag and .listen == "0.0.0.0" and .port == $port and
             .protocol == "hysteria" and .settings.version == 2 and
             .streamSettings.security == "tls" and
-            .streamSettings.hysteriaSettings.masquerade.url == $masq
+            .streamSettings.hysteriaSettings.masquerade.url == $masq and
+            .streamSettings.tlsSettings.certificates == [{
+              certificateFile: $cert_path, keyFile: $key_path
+            }] and
+            ([.streamSettings.tlsSettings.certificates[] |
+              has("certificate") or has("key")] | any | not)
           )] | length == 1
         ' "${PRIVATE_DIR}/config-profile.ready.json" >/dev/null || \
-            die 'Hysteria2 inbound lost its UDP/443 or loopback masquerade contract.'
+            die 'Hysteria2 inbound lost its UDP/443, mounted-certificate, or masquerade contract.'
+        xray_server_mounts=(
+            -v "${PRIVATE_DIR}/hysteria-tls:${HYSTERIA_CERT_CONTAINER_DIR}:ro"
+        )
     fi
+
+    [[ "$(grep -Fc 'Exclude formats: XRAY_JSON' "${PRIVATE_DIR}/PANEL-STAGE-1.txt")" \
+        == "${expected_hosts}" ]] || \
+        die 'Panel guide does not exclude every physical Host from standalone XRAY_JSON output.'
 
     jq -e --argjson expected "${expected_hosts}" '
       .remnawave.injectHosts[0].selectFrom == "HIDDEN" and
@@ -2096,6 +2128,7 @@ validate_artifacts() {
         die 'AUTO template lost its hidden-Host, leastPing or DoH-only contract.'
 
     docker run --rm --pull never --network none --cap-drop ALL --read-only \
+        "${xray_server_mounts[@]}" \
         -v "${PRIVATE_DIR}/config-profile.ready.json:/etc/xray/config.json:ro" \
         --entrypoint /usr/local/bin/xray "${NODE_IMAGE}" \
         run -test -config /etc/xray/config.json >/dev/null
@@ -2108,6 +2141,21 @@ validate_artifacts() {
     docker compose --env-file "${PRIVATE_DIR}/edge.env" \
         -f "${INSTALL_DIR}/docker-compose.edge.yml" config --quiet
     docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" config --quiet
+    node_compose_json="$(docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" \
+        config --format json)"
+    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
+        jq -e --arg target "${HYSTERIA_CERT_CONTAINER_DIR}" '
+          [.services.node.volumes[] | select(
+            .type == "bind" and .target == $target and .read_only == true
+          )] | length == 1
+        ' <<<"${node_compose_json}" >/dev/null || \
+            die 'Node Compose lost the read-only Hysteria certificate bind mount.'
+    else
+        jq -e --arg target "${HYSTERIA_CERT_CONTAINER_DIR}" '
+          [(.services.node.volumes // [])[] | select(.target == $target)] | length == 0
+        ' <<<"${node_compose_json}" >/dev/null || \
+            die 'Node Compose unexpectedly mounts Hysteria certificates while transport is disabled.'
+    fi
 
     docker run --rm --pull never --network none --cap-drop ALL --read-only \
         --env-file "${PRIVATE_DIR}/edge.env" \
@@ -2212,6 +2260,13 @@ port_is_loopback_only() {
 
 container_is_running() {
     [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == true ]]
+}
+
+container_has_readonly_mount() {
+    local container="$1" destination="$2"
+    docker inspect "${container}" 2>/dev/null | jq -e --arg destination "${destination}" '
+      .[0].Mounts | any(.Destination == $destination and .RW == false)
+    ' >/dev/null
 }
 
 tcp_port_owned_by_container() {
@@ -2894,7 +2949,7 @@ untune_stage() {
 }
 
 node_stage() {
-    local node_was_running=0
+    local node_was_running=0 node_reconciled=0
     announce_stage node
     require_root
     need_commands
@@ -2915,6 +2970,15 @@ node_stage() {
     fi
     container_is_running "${NODE_CONTAINER}" && node_was_running=1
     if [[ "${node_was_running}" == 1 ]]; then
+        if [[ "${ENABLE_HYSTERIA}" == 1 ]] && \
+           ! container_has_readonly_mount "${NODE_CONTAINER}" "${HYSTERIA_CERT_CONTAINER_DIR}"; then
+            log 'Reconciling the existing Node with the protected read-only Hysteria certificate mount...'
+            docker compose -f "${INSTALL_DIR}/docker-compose.node.yml" up -d node
+            wait_for_node_ready
+            container_has_readonly_mount "${NODE_CONTAINER}" "${HYSTERIA_CERT_CONTAINER_DIR}" || \
+                die 'Node recreation completed without the required Hysteria certificate mount.'
+            node_reconciled=1
+        fi
         port_is_listening "${NODE_PORT}" || die 'Existing managed Node has no API listener.'
         [[ "${ENABLE_SELF_REALITY}" != 1 ]] || port_is_listening "${RAW_BACKEND_PORT}" || \
             die 'Existing managed Node has no self-SNI REALITY listener.'
@@ -2926,7 +2990,11 @@ node_stage() {
         panel_control_observed || die 'Existing managed Node has no successful Panel management exchange.'
         check_negative_mtls
         [[ "${ENABLE_XHTTP}" != 1 ]] || check_runtime_path
-        log 'Existing managed Node passed control-plane and runtime-contract checks; it was not recreated.'
+        if [[ "${node_reconciled}" == 1 ]]; then
+            log 'Existing managed Node was reconciled and passed control-plane/runtime checks.'
+        else
+            log 'Existing managed Node passed control-plane and runtime-contract checks; it was not recreated.'
+        fi
         return 0
     fi
     arm_stage_rollback node
@@ -3778,6 +3846,10 @@ selftest_stage() {
     write_state
     render_all_files
     ensure_node_env_placeholder
+    validate_artifacts
+    ENABLE_HYSTERIA=0
+    HYSTERIA_HOST_UUID=''
+    render_all_files
     validate_artifacts
     bash -n "${BASH_SOURCE[0]}"
     check_repository_secret_hygiene

@@ -6,7 +6,7 @@
 
 Зафиксированная совместимая база:
 
-- NodeInstallator `2026-08-13.6`;
+- NodeInstallator `2026-08-13.7`;
 - Remnawave Panel/Backend `2.8.1`;
 - Remnawave Node `2.8.0`;
 - встроенный Xray `26.6.27`;
@@ -41,6 +41,9 @@ Panel -> allowlisted Node API port -> Remnawave Node -> managed Xray
   `auto`; на HTTP/2 это обычно выбирает быстрый `stream-up`, не фиксируя
   `packet-up` для всех клиентов;
 - Hysteria2 включается отдельно и использует `UDP/443`;
+- Hysteria2 certificate/key хранятся отдельными файлами `0600` на Node и
+  передаются в Node-контейнер read-only volume; PEM и private key не
+  встраиваются в Config Profile;
 - Xray/Caddy/HAProxy backend-порты остаются на loopback;
 - Node API разрешается только реально наблюдаемому egress IP панели;
 - мастер генерирует XRAY_JSON AUTO template для Happ/INCY;
@@ -124,6 +127,9 @@ sudo RW_QUIET=1 ./remnawave-edge-oneclick.sh verify
 2. Создать Node на предложенном control-plane порту и получить `SECRET_KEY`.
 3. Запустить стадию `node` и дождаться настоящей Panel mTLS-сессии.
 4. Создать canary Internal Squad, пользователя и физические Hosts.
+   У каждого физического Host включить `Hide Host` и добавить
+   `XRAY_JSON` в `Exclude formats`: UUID-injector Backend 2.8.1 всё равно
+   использует эти Host, но отдельные JSON-конфиги из них не генерируются.
 5. Передать UUID Hosts стадии `template`.
 6. Добавить готовый XRAY_JSON template и AUTO Host по сгенерированной памятке.
 7. Выполнить `edge`, затем `verify-auth`.
