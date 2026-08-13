@@ -1,0 +1,134 @@
+# NodeInstallator
+
+Интерактивный мастер для развёртывания Remnawave edge на чистом сервере.
+Скрипт собирает staged-конфигурацию, выдаёт точные поля для Remnawave Panel,
+запускает Node и поднимает несколько клиентских транспортов на одном edge.
+
+Зафиксированная совместимая база:
+
+- NodeInstallator `2026-08-13.4`;
+- Remnawave Panel/Backend `2.8.1`;
+- Remnawave Node `2.8.0`;
+- встроенный Xray `26.6.27`;
+- pinned Docker-образы Node, HAProxy и Caddy;
+- клиентский fingerprint по умолчанию — `firefox`.
+
+Скрипт не обещает универсальную «неблокируемость»: доступность зависит от
+оператора, региона, маршрута и текущего поведения DPI. Развёртывание нужно
+начинать с canary-пользователя и проверять из тех сетей, где будут клиенты.
+
+## Что разворачивается
+
+```text
+TCP/443 -> HAProxy SNI routing
+             |-- VLESS RAW + REALITY + Vision
+             `-- Caddy TLS/HTTP2 -> VLESS XHTTP packet-up
+
+UDP/443 -> optional Hysteria2
+
+Panel -> allowlisted Node API port -> Remnawave Node -> managed Xray
+```
+
+- RAW/REALITY использует локальный HTTPS cover-site и не создаёт петлю через
+  публичный `443`;
+- XHTTP работает за обычным TLS/HTTP/2 и случайным закрытым path;
+- Hysteria2 включается отдельно и использует `UDP/443`;
+- Xray/Caddy/HAProxy backend-порты остаются на loopback;
+- Node API разрешается только реально наблюдаемому egress IP панели;
+- мастер генерирует XRAY_JSON AUTO template для Happ/INCY;
+- изменения UFW и server tuning имеют отдельный явный rollback.
+
+## Требования
+
+- чистый Ubuntu или Debian с `apt` и systemd;
+- root/sudo и доступ к provider console/OOB;
+- публичный IPv4 сервера;
+- два разных домена с A-записями на этот IPv4;
+- стабильный исходящий/NAT IPv4 Remnawave Panel для allowlist Node API;
+- открытый `TCP/443`, а для Hysteria2 также `UDP/443`, в firewall провайдера.
+
+Не публикуйте AAAA, пока на сервере нет реально работающего глобального IPv6.
+
+## Быстрый запуск
+
+```bash
+git clone https://github.com/Vlone111/NodeInstallator.git
+cd NodeInstallator
+chmod 700 remnawave-edge-oneclick.sh
+
+sudo ./remnawave-edge-oneclick.sh bootstrap
+sudo ./remnawave-edge-oneclick.sh selftest
+sudo ./remnawave-edge-oneclick.sh all
+```
+
+Запуск без аргументов открывает интерактивное меню:
+
+```bash
+sudo ./remnawave-edge-oneclick.sh
+```
+
+Монохромный и автоматизированный вывод:
+
+```bash
+sudo RW_NO_COLOR=1 ./remnawave-edge-oneclick.sh status
+sudo RW_ASCII=1 ./remnawave-edge-oneclick.sh
+sudo RW_QUIET=1 ./remnawave-edge-oneclick.sh verify
+```
+
+Скрипт также поддерживает стандартную переменную `NO_COLOR`.
+
+## Этапы
+
+| Команда | Назначение |
+|---|---|
+| `bootstrap` | Установить базовые пакеты и Docker Compose |
+| `selftest` | Изолированно сгенерировать и проверить конфигурацию |
+| `init` | Собрать параметры и подготовить защищённые файлы |
+| `panel` | Показать точные поля первого этапа Panel 2.8.1 |
+| `node` | Принять скрытый `SECRET_KEY`, применить allowlist и запустить Node |
+| `template` | Принять UUID физических Hosts и создать AUTO template |
+| `edge` | Запустить HAProxy/Caddy и проверить публичный `443` |
+| `verify` | Проверить DNS, mTLS, TLS, listener ownership и маршрутизацию |
+| `verify-auth` | Проверить все выбранные транспорты с canary-пользователем |
+| `status` | Показать read-only состояние контейнеров и сокетов |
+| `tune` / `untune` | Применить или восстановить сетевые sysctl |
+| `rollback` | Остановить только созданные мастером контейнеры |
+| `rollback-host` | Дополнительно восстановить UFW и tuning |
+
+Полная справка:
+
+```bash
+./remnawave-edge-oneclick.sh --help
+```
+
+## Последовательность в Panel
+
+Мастер сам останавливается в нужных точках. Общая последовательность:
+
+1. Создать новый Config Profile из защищённого
+   `/opt/remnawave-edge/private/config-profile.ready.json`.
+2. Создать Node на предложенном control-plane порту и получить `SECRET_KEY`.
+3. Запустить стадию `node` и дождаться настоящей Panel mTLS-сессии.
+4. Создать canary Internal Squad, пользователя и физические Hosts.
+5. Передать UUID Hosts стадии `template`.
+6. Добавить готовый XRAY_JSON template и AUTO Host по сгенерированной памятке.
+7. Выполнить `edge`, затем `verify-auth`.
+8. Проверить Happ/INCY в TUN-режиме и только потом расширять аудиторию.
+
+Точные имена inbound, Host visibility, SNI, port, fingerprint, path и template
+показываются в файлах `PANEL-STAGE-1.txt` и `PANEL-STAGE-2.txt` внутри
+защищённого каталога установки.
+
+## Безопасность
+
+- `SECRET_KEY`, REALITY private key, short ID, TLS private keys, UUID
+  пользователей, готовые подписки и raw runtime config нельзя коммитить;
+- закрытые файлы находятся в `/opt/remnawave-edge/private` с режимами
+  `0700/0600`;
+- мастер не печатает секреты или сгенерированный XHTTP path;
+- Node API не является user-plane портом и не должен быть открыт всему миру;
+- `rollback` не удаляет recovery data, сертификаты или DNS;
+- перед `rollback-host` требуется отдельное подтверждение `RESTORE`.
+
+Если secret когда-либо попал в Git history, недостаточно удалить файл —
+перевыпустите Node secret в Panel до дальнейшего использования.

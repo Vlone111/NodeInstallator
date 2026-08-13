@@ -1,0 +1,32 @@
+# Runtime secrets and generated private state
+.env
+.env.*
+!.env.example
+private/
+runtime/
+state.env
+node.env
+edge.env
+
+# Keys, certificate bundles and subscription material
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileconfig
+*.subscription
+*subscription*.json
+*runtime*.json
+*.ready.json
+
+# Backups, editor and operating-system files
+*.bak
+*.bak-*
+*.backup
+*.swp
+*.tmp
+.idea/
+.vscode/
+.DS_Store
