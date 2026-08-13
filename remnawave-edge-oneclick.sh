@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-13.8'
+SCRIPT_VERSION='2026-08-13.9'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -742,7 +742,10 @@ load_state() {
     ENABLE_EXTERNAL_REALITY="${ENABLE_EXTERNAL_REALITY:-0}"
     ENABLE_XHTTP="${ENABLE_XHTTP:-1}"
     ENABLE_HYSTERIA="${ENABLE_HYSTERIA:-0}"
-    ENABLE_RAW_FRAGMENT="${ENABLE_RAW_FRAGMENT:-1}"
+    # Client FinalMask is an opt-in canary.  Keep legacy state files safe: Happ
+    # releases that bundle Xray <= 26.5.9 reject the newer plural
+    # `lengths`/`delays` fragment schema before the client core can start.
+    ENABLE_RAW_FRAGMENT="${ENABLE_RAW_FRAGMENT:-0}"
     FRAGMENT_REALITY="${FRAGMENT_REALITY:-self}"
     CLIENT_FINGERPRINT="${CLIENT_FINGERPRINT:-firefox}"
     CLIENT_FINGERPRINT="${CLIENT_FINGERPRINT,,}"
@@ -1378,7 +1381,9 @@ EOF
 
 render_finalmask() {
     # Client-side only.  Never paste this into the Config Profile/server
-    # inbound on Xray 26.6.27.
+    # inbound.  Use the singular fragment fields shared by Xray 26.5.9 and
+    # 26.6.27: plural `lengths`/`delays` makes Happ's older core decode an empty
+    # `length` and fail with "LengthMin can't be 0".
     cat >"${INSTALL_DIR}/finalmask-fragment-canary.json" <<'EOF'
 {
   "tcp": [
@@ -1386,8 +1391,8 @@ render_finalmask() {
       "type": "fragment",
       "settings": {
         "packets": "tlshello",
-        "lengths": ["5-10", "10-20", "20-40"],
-        "delays": ["0-2"],
+        "length": "10-20",
+        "delay": "0-2",
         "maxSplit": "3-5"
       }
     }
@@ -2038,6 +2043,16 @@ validate_artifacts() {
     jq empty "${PRIVATE_DIR}/config-profile.ready.json"
     jq empty "${PRIVATE_DIR}/xray-json-auto.template.json"
     jq empty "${INSTALL_DIR}/finalmask-fragment-canary.json"
+    jq -e '
+      (.tcp | type == "array" and length == 1) and
+      (.tcp[0].type == "fragment") and
+      (.tcp[0].settings |
+        .packets == "tlshello" and
+        (.length | type == "string" and length > 0) and
+        (.delay | type == "string" and length > 0) and
+        (has("lengths") | not) and (has("delays") | not))
+    ' "${INSTALL_DIR}/finalmask-fragment-canary.json" >/dev/null ||
+        die 'FinalMask fragment must use the Happ-compatible singular length/delay schema.'
     [[ ! -f "${PRIVATE_DIR}/xray-json-auto.ready.json" ]] || \
         jq empty "${PRIVATE_DIR}/xray-json-auto.ready.json"
 
@@ -2654,7 +2669,7 @@ init_stage() {
     ((ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA > 0)) || \
         die 'Select at least one transport.'
     if [[ "${ENABLE_SELF_REALITY}" == 1 || "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
-        prompt_yes_no ENABLE_RAW_FRAGMENT 'Generate one isolated client-fragment A/B Host?' 1
+        prompt_yes_no ENABLE_RAW_FRAGMENT 'Generate one isolated client-fragment A/B Host?' 0
     else
         ENABLE_RAW_FRAGMENT=0
     fi

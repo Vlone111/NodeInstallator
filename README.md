@@ -6,7 +6,7 @@
 
 Зафиксированная совместимая база:
 
-- NodeInstallator `2026-08-13.8`;
+- NodeInstallator `2026-08-13.9`;
 - Remnawave Panel/Backend `2.8.1`;
 - Remnawave Node `2.8.0`;
 - встроенный Xray `26.6.27`;
@@ -148,6 +148,12 @@ sudo RW_QUIET=1 ./remnawave-edge-oneclick.sh verify
 REALITY, XHTTP и Hysteria2. Можно включить любой один транспорт или сочетание;
 для каждого выбранного пути генерируется отдельный inbound и физический Host.
 Рекомендуемый canary-набор — все четыре, после измерений можно убрать лишнее.
+
+Отдельный Fragment/FinalMask Host по умолчанию выключен и предназначен только
+для изолированного A/B-теста. Его fragment использует singular-поля
+`length`/`delay`, совместимые с Xray 26.5.9 в Happ и с Node Xray 26.6.27.
+Plural-поля `lengths`/`delays` на старом ядре приводят к ошибке запуска
+`LengthMin can't be 0`.
 
 Для внешнего REALITY пункт `Auto benchmark` выбирает не «вечный лучший SNI», а
 лучший из доступных кандидатов именно с текущей ноды в момент установки. CDN
