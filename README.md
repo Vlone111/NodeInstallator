@@ -6,7 +6,7 @@
 
 Зафиксированная совместимая база:
 
-- NodeInstallator `2026-08-14.3`;
+- NodeInstallator `2026-08-14.4`;
 - Remnawave Panel/Backend `2.8.1`;
 - Remnawave Node `2.8.0`;
 - встроенный Xray `26.6.27`;
@@ -53,6 +53,8 @@ Panel -> allowlisted Node API port -> Remnawave Node -> managed Xray
 - локальный cover-site — полноценный адаптивный endpoint dashboard без
   сторонних CDN, analytics и cookies; его статический payload жёстко ограничен
   40 MiB (фактический размер значительно меньше);
+- DNS preflight использует только Cloudflare и Google DoH по HTTPS; прямые
+  запросы к authoritative DNS и исходящий UDP/TCP 53 не требуются;
 - host tuning включает live `fq`, BBR, MTU probing и 32 MiB TCP autotuning;
   контейнеры используют относительные CPU weights без жёсткого CFS-потолка,
   поэтому свободные vCPU доступны для кратковременного throughput burst;
