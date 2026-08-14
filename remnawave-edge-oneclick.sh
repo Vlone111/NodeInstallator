@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-14.2'
+SCRIPT_VERSION='2026-08-14.3'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -2350,11 +2350,51 @@ validate_artifacts() {
     log 'Artifact validation passed.'
 }
 
+doh_record_values() {
+    local endpoint="$1" name="$2" record_type="$3" numeric_type payload
+    case "${record_type}" in
+        A) numeric_type=1 ;;
+        NS) numeric_type=2 ;;
+        AAAA) numeric_type=28 ;;
+        *) return 2 ;;
+    esac
+    payload="$(curl --fail --silent --show-error \
+        --connect-timeout 4 --max-time 10 --retry 1 \
+        --header 'accept: application/dns-json' \
+        --get --data-urlencode "name=${name}" --data-urlencode "type=${record_type}" \
+        "${endpoint}")" || return 1
+    jq -e '.Status == 0' <<<"${payload}" >/dev/null 2>&1 || return 1
+    jq -r --argjson numeric_type "${numeric_type}" '
+      [(.Answer // [])[] | select(.type == $numeric_type) |
+        (.data | sub("\\.$"; ""))] | unique | .[]
+    ' <<<"${payload}" 2>/dev/null
+}
+
+direct_dns_record_values() {
+    local nameserver="$1" name="$2" record_type="$3" answer
+    if answer="$(dig +time=4 +tries=1 +short \
+      @"${nameserver}" "${record_type}" "${name}" 2>/dev/null)"; then
+        printf '%s\n' "${answer}" | sed '/^$/d; s/\.$//' | sort -u
+        return 0
+    fi
+    if answer="$(dig +tcp +time=5 +tries=1 +short \
+      @"${nameserver}" "${record_type}" "${name}" 2>/dev/null)"; then
+        printf '%s\n' "${answer}" | sed '/^$/d; s/\.$//' | sort -u
+        return 0
+    fi
+    return 1
+}
+
 find_authoritative_nameservers() {
     local name="$1" candidate ns
     candidate="${name}"
     while [[ "${candidate}" == *.* ]]; do
-        ns="$(dig +short NS "${candidate}" | sed 's/\.$//' | sort -u)"
+        ns="$(dig +time=3 +tries=1 +short NS "${candidate}" 2>/dev/null | \
+            sed 's/\.$//' | sort -u)"
+        if [[ -z "${ns}" ]]; then
+            ns="$(doh_record_values 'https://dns.google/resolve' \
+                "${candidate}" NS 2>/dev/null | sort -u || true)"
+        fi
         if [[ -n "${ns}" ]]; then
             printf '%s\n' "${ns}"
             return 0
@@ -2365,27 +2405,43 @@ find_authoritative_nameservers() {
 }
 
 check_one_domain_dns() {
-    local domain="$1" resolver answer nameservers ns authoritative_seen=0
+    local domain="$1" resolver_name resolver_url answer aaaa nameservers ns
+    local authoritative_seen=0
     nameservers="$(find_authoritative_nameservers "${domain}")" || \
         die "No authoritative nameserver found for ${domain}."
     while IFS= read -r ns; do
         [[ -n "${ns}" ]] || continue
-        answer="$(dig +time=4 +tries=1 +short @"${ns}" A "${domain}" | sort -u)"
+        if ! answer="$(direct_dns_record_values "${ns}" "${domain}" A)"; then
+            warn "Authoritative DNS ${ns} is unreachable over UDP/TCP 53 from this Node; trying the next authority."
+            continue
+        fi
         [[ "${answer}" == "${EDGE_IPV4}" ]] || \
             die "Authoritative DNS ${ns} gives '${answer:-no A}' for ${domain}; expected ${EDGE_IPV4}."
-        [[ -z "$(dig +time=4 +tries=1 +short @"${ns}" AAAA "${domain}" | sort -u)" ]] || \
+        if ! aaaa="$(direct_dns_record_values "${ns}" "${domain}" AAAA)"; then
+            warn "Authoritative DNS ${ns} did not complete the AAAA check; trying the next authority."
+            continue
+        fi
+        [[ -z "${aaaa}" ]] || \
             die "${domain} has AAAA but this IPv4-only edge does not serve IPv6."
         authoritative_seen=1
     done <<<"${nameservers}"
-    ((authoritative_seen == 1)) || die "Could not verify authoritative DNS for ${domain}."
+    if ((authoritative_seen == 0)); then
+        warn "Direct authoritative DNS is unreachable from this Node; requiring agreement from Cloudflare and Google over HTTPS instead."
+    fi
 
-    for resolver in 1.1.1.1 8.8.8.8; do
-        answer="$(dig +time=4 +tries=1 +short @"${resolver}" A "${domain}" | sort -u)"
+    while IFS='|' read -r resolver_name resolver_url; do
+        answer="$(doh_record_values "${resolver_url}" "${domain}" A | sort -u)" || \
+            die "${resolver_name} DoH could not resolve A for ${domain}."
         [[ "${answer}" == "${EDGE_IPV4}" ]] || \
-            die "Resolver ${resolver} gives '${answer:-no A}' for ${domain}; expected ${EDGE_IPV4}."
-        [[ -z "$(dig +time=4 +tries=1 +short @"${resolver}" AAAA "${domain}" | sort -u)" ]] || \
-            die "Resolver ${resolver} sees unsupported AAAA for ${domain}."
-    done
+            die "${resolver_name} DoH gives '${answer:-no A}' for ${domain}; expected ${EDGE_IPV4}."
+        aaaa="$(doh_record_values "${resolver_url}" "${domain}" AAAA | sort -u)" || \
+            die "${resolver_name} DoH could not resolve AAAA for ${domain}."
+        [[ -z "${aaaa}" ]] || \
+            die "${resolver_name} DoH sees unsupported AAAA for ${domain}."
+    done <<'EOF'
+Cloudflare|https://cloudflare-dns.com/dns-query
+Google|https://dns.google/resolve
+EOF
 }
 
 check_dns() {
@@ -2393,7 +2449,7 @@ check_dns() {
         warn 'DNS checks skipped by RW_SKIP_DNS=1.'
         return 0
     fi
-    log 'Checking authoritative DNS and two independent recursive resolvers...'
+    log 'Checking authoritative DNS plus Cloudflare and Google DoH...'
     check_one_domain_dns "${REALITY_SNI}"
     if [[ "${ENABLE_XHTTP}" == 1 ]]; then check_one_domain_dns "${XHTTP_SNI}"; fi
     log 'DNS checks passed.'
