@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-14.5'
+SCRIPT_VERSION='2026-08-14.6'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -1842,6 +1842,9 @@ ${migration_note}
    Add one ACTIVE canary user. Keep HWID off for the first test.
 
 4. CREATE ONLY THE SELECTED PHYSICAL HOSTS
+
+   Naming note: FF means the Firefox client fingerprint. It never means
+   FinalMask. FinalMask belongs only to a separately named FRAGMENT Host.
 ${self_section}
 ${external_section}
 ${fragment_section}
@@ -2760,13 +2763,42 @@ show_configuration_summary() {
 
 init_stage() {
     local detected_ip default_node_name
+    local fragment_override_set=0 fragment_override='' fragment_base_override=''
     announce_stage init
     require_root
     set_paths
     need_commands
     persist_installer
+    if [[ ${RW_ENABLE_RAW_FRAGMENT+x} ]]; then
+        fragment_override_set=1
+        fragment_override="${RW_ENABLE_RAW_FRAGMENT}"
+        fragment_base_override="${RW_FRAGMENT_REALITY:-external}"
+    fi
     if [[ -f "${STATE_FILE}" ]]; then
         load_state
+        if [[ "${fragment_override_set}" == 1 ]]; then
+            [[ "${fragment_override}" =~ ^[01]$ ]] || \
+                die 'RW_ENABLE_RAW_FRAGMENT must be 0 or 1.'
+            if [[ "${fragment_override}" == 1 ]]; then
+                [[ "${ENABLE_SELF_REALITY}" == 1 || "${ENABLE_EXTERNAL_REALITY}" == 1 ]] || \
+                    die 'FinalMask/fragment Host requires at least one selected REALITY inbound.'
+                case "${fragment_base_override}" in
+                    external)
+                        [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]] || \
+                            die 'RW_FRAGMENT_REALITY=external requires the external REALITY inbound.'
+                        ;;
+                    self)
+                        [[ "${ENABLE_SELF_REALITY}" == 1 ]] || \
+                            die 'RW_FRAGMENT_REALITY=self requires the self-SNI REALITY inbound.'
+                        ;;
+                    *) die 'RW_FRAGMENT_REALITY must be self or external.' ;;
+                esac
+                FRAGMENT_REALITY="${fragment_base_override}"
+            else
+                FRAGMENT_REALITY='self'
+            fi
+            ENABLE_RAW_FRAGMENT="${fragment_override}"
+        fi
         validate_loaded_state
         pull_images
         if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
@@ -2793,7 +2825,7 @@ init_stage() {
     ENABLE_EXTERNAL_REALITY="${RW_ENABLE_EXTERNAL_REALITY:-}"
     ENABLE_XHTTP="${RW_ENABLE_XHTTP:-}"
     ENABLE_HYSTERIA="${RW_ENABLE_HYSTERIA:-}"
-    ENABLE_RAW_FRAGMENT="${RW_ENABLE_RAW_FRAGMENT:-0}"
+    ENABLE_RAW_FRAGMENT="${RW_ENABLE_RAW_FRAGMENT:-}"
     FRAGMENT_REALITY="${RW_FRAGMENT_REALITY:-self}"
     BLOCK_CLIENT_QUIC="${RW_BLOCK_CLIENT_QUIC:-1}"
     APPLY_TUNING="${RW_APPLY_TUNING:-1}"
@@ -2810,6 +2842,9 @@ init_stage() {
         die 'Select at least one transport.'
     if [[ "${ENABLE_SELF_REALITY}" != 1 && "${ENABLE_EXTERNAL_REALITY}" != 1 ]]; then
         ENABLE_RAW_FRAGMENT=0
+    else
+        prompt_yes_no ENABLE_RAW_FRAGMENT \
+            'Create a separate REALITY FinalMask/ClientHello-fragment A/B Host?' 0
     fi
     if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
         if [[ "${ENABLE_SELF_REALITY}" == 1 && "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
