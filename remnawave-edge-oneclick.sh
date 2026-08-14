@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-14.1'
+SCRIPT_VERSION='2026-08-14.2'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -607,6 +607,16 @@ prompt_value() {
     printf -v "${variable}" '%s' "${answer}"
 }
 
+normalize_yes_no_answer() {
+    local answer="$1"
+    # Some SSH/web consoles append CR or whitespace to pasted single-key
+    # answers. Strip both ends before applying ASCII case folding.
+    answer="${answer//$'\r'/}"
+    answer="${answer#"${answer%%[![:space:]]*}"}"
+    answer="${answer%"${answer##*[![:space:]]}"}"
+    printf '%s' "${answer,,}"
+}
+
 prompt_yes_no() {
     local variable="$1" label="$2" default_value="${3:-1}" current answer suffix
     current="${!variable:-}"
@@ -620,12 +630,12 @@ prompt_yes_no() {
         printf '%b?%b %s %b[%s]%b: ' "${UI_CYAN}${UI_BOLD}" "${UI_RESET}" "${label}" \
             "${UI_DIM}" "${suffix}" "${UI_RESET}"
         IFS= read -r answer || die 'Input was interrupted.'
-        answer="${answer,,}"
+        answer="$(normalize_yes_no_answer "${answer}")"
         case "${answer}" in
             '') printf -v "${variable}" '%s' "${default_value}"; return 0 ;;
-            y|yes) printf -v "${variable}" '%s' 1; return 0 ;;
-            n|no) printf -v "${variable}" '%s' 0; return 0 ;;
-            *) warn 'Please answer y or n.' ;;
+            y|yes|1|true|on) printf -v "${variable}" '%s' 1; return 0 ;;
+            n|no|0|false|off) printf -v "${variable}" '%s' 0; return 0 ;;
+            *) warn "Please answer y or n, or press Enter for the ${suffix:0:1} default." ;;
         esac
     done
 }
@@ -4036,6 +4046,10 @@ selftest_stage() {
     announce_stage selftest
     require_root
     need_commands
+    [[ "$(normalize_yes_no_answer $'  Y\r ')" == y ]] || \
+        die 'Yes/no input normalization rejected uppercase or terminal whitespace.'
+    [[ "$(normalize_yes_no_answer $'\tNO  ')" == no ]] || \
+        die 'Yes/no input normalization rejected uppercase or terminal whitespace.'
     original_install="${INSTALL_DIR}"
     temp_root="$(mktemp -d /tmp/remnawave-edge-selftest.XXXXXX)"
     selftest_cleanup() {
