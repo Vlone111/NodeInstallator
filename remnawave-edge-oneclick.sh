@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-14.4'
+SCRIPT_VERSION='2026-08-14.5'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -217,7 +217,7 @@ announce_stage() {
         template)      ui_section 'Panel - stage 2' 'physical Host UUIDs and XRAY_JSON AUTO template' ;;
         edge)          ui_section 'Edge' 'HAProxy, Caddy, certificates and public 443' ;;
         verify)        ui_section 'Verification' 'DNS, mTLS, listeners, TLS and routing' ;;
-        verify-auth)   ui_section 'Authenticated tests' 'every selected transport with temporary canary credentials' ;;
+        verify-auth)   ui_section 'Authenticated tests' 'every selected transport with an active canary credential' ;;
         tune)          ui_section 'Network tuning' 'reversible measured server baseline' ;;
         untune)        ui_section 'Restore tuning' 'restore the recorded pre-wizard sysctl state' ;;
         status)        ui_section 'Status' 'read-only runtime overview' ;;
@@ -3620,6 +3620,42 @@ validate_client_config() {
         run -test -config /etc/xray/client.json >/dev/null
 }
 
+cold_config_has_selected_credentials() {
+    local runtime="$1" credential=''
+    if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
+        credential="$(jq -r --arg tag "${RAW_TAG}" \
+            '.inbounds[] | select(.tag == $tag) | .settings.clients[0].id // empty' \
+            "${runtime}")"
+        validate_uuid "${credential}" || return 1
+    fi
+    if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
+        credential="$(jq -r --arg tag "${EXTERNAL_REALITY_TAG}" \
+            '.inbounds[] | select(.tag == $tag) | .settings.clients[0].id // empty' \
+            "${runtime}")"
+        validate_uuid "${credential}" || return 1
+    fi
+    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
+        credential="$(jq -r --arg tag "${XHTTP_TAG}" \
+            '.inbounds[] | select(.tag == $tag) | .settings.clients[0].id // empty' \
+            "${runtime}")"
+        validate_uuid "${credential}" || return 1
+    fi
+    if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
+        credential="$(jq -r --arg tag "${HYSTERIA_TAG}" \
+            '.inbounds[] | select(.tag == $tag) | .settings.clients[0].auth // empty' \
+            "${runtime}")"
+        validate_uuid "${credential}" || return 1
+    fi
+}
+
+dump_cold_runtime_config() {
+    local output="$1"
+    : >"${output}"
+    chmod 0600 "${output}"
+    docker exec "${NODE_CONTAINER}" cli --dump-config-raw >"${output}" 2>/dev/null || \
+        die 'Could not read protected live Node config.'
+}
+
 run_transport_test() {
     local name="$1" container="$2" port="$3" config="$4" attempt code
     docker run --detach --rm --pull never --name "${container}" \
@@ -3706,8 +3742,19 @@ verify_auth_stage() {
     }
     trap auth_cleanup EXIT RETURN
     install -m 0600 /dev/null "${runtime}"
-    docker exec "${NODE_CONTAINER}" cli --dump-config-raw >"${runtime}" 2>/dev/null || \
-        die 'Could not read protected live Node config.'
+    dump_cold_runtime_config "${runtime}"
+    if ! cold_config_has_selected_credentials "${runtime}"; then
+        warn 'The Node cold-start config has no active credential for every selected inbound.'
+        warn 'RemnaNode 2.8.0 does not write incremental HandlerService add-user changes back into cli --dump-config-raw.'
+        warn 'This does not prove that client authentication or a transport is broken.'
+        if [[ "${NON_INTERACTIVE}" == 1 || ! -t 0 ]]; then
+            die 'In Panel, verify an ACTIVE canary user is in the Internal Squad, then force-restart Xray on this Node for a full resync and rerun verify-auth.'
+        fi
+        wait_for_enter $'In Panel: verify the canary user is ACTIVE and belongs to this Internal Squad,\nthen use the Node action to force-restart Xray. Wait until Xray is Running.'
+        dump_cold_runtime_config "${runtime}"
+        cold_config_has_selected_credentials "${runtime}" || \
+            die 'The full-start config still has no credential. Recheck ACTIVE user -> Internal Squad -> all selected inbounds -> this Node, then force-restart Xray again.'
+    fi
     render_auth_clients "${runtime}" "${raw_config}" "${external_config}" \
         "${xhttp_config}" "${hysteria_config}"
     if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
