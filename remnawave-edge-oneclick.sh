@@ -17,7 +17,7 @@ export LC_ALL=C
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
 # Host UUIDs are Panel outputs and are requested only at explicit stage gates.
 
-SCRIPT_VERSION='2026-08-13.10'
+SCRIPT_VERSION='2026-08-14.1'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -1106,6 +1106,10 @@ render_caddy() {
     }
     @health path /health.txt
     header @health Cache-Control "no-store"
+    @documents path / /index.html /status.html /about.html /404.html
+    header @documents Cache-Control "no-cache"
+    @assets path *.css *.js *.svg *.webmanifest
+    header @assets Cache-Control "public, max-age=86400, stale-while-revalidate=604800"
     handle_errors {
         rewrite * /404.html
         file_server
@@ -1132,6 +1136,7 @@ https://{$REALITY_SNI}:19443 {
     respond @sitemap `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://{$REALITY_SNI}/</loc></url>
+  <url><loc>https://{$REALITY_SNI}/status.html</loc></url>
   <url><loc>https://{$REALITY_SNI}/about.html</loc></url>
 </urlset>` 200
     file_server
@@ -1152,6 +1157,7 @@ https://{$XHTTP_SNI}:19443 {
     respond @sitemap `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://{$XHTTP_SNI}/</loc></url>
+  <url><loc>https://{$XHTTP_SNI}/status.html</loc></url>
   <url><loc>https://{$XHTTP_SNI}/about.html</loc></url>
 </urlset>` 200
     @xhttp path {$XHTTP_PATH}*
@@ -1176,54 +1182,92 @@ render_site() {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="A small independent network availability and latency diagnostic">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#071018">
+  <meta name="description" content="Independent endpoint availability, latency and browser route diagnostics">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/site.webmanifest">
   <link rel="stylesheet" href="/site.css">
-  <title>Northstar Network Check</title>
+  <title>Northstar · Edge Observatory</title>
 </head>
 <body>
-  <header class="nav"><a class="brand" href="/">Northstar</a><nav><a href="/about.html">About</a><a href="/health.txt">Raw health</a></nav></header>
+  <div class="ambient ambient-a" aria-hidden="true"></div><div class="ambient ambient-b" aria-hidden="true"></div>
+  <header class="nav wrap">
+    <a class="brand" href="/" aria-label="Northstar home"><span class="brand-mark">N</span><span>Northstar</span></a>
+    <nav aria-label="Primary"><a class="active" href="/">Overview</a><a href="/status.html">Status</a><a href="/about.html">Method</a></nav>
+    <a class="nav-action" href="/status.html">Open diagnostics <span aria-hidden="true">↗</span></a>
+  </header>
   <main>
-    <section class="hero">
-      <p class="eyebrow">Independent endpoint</p>
-      <h1>Is this route healthy?</h1>
-      <p class="lead">Run a lightweight same-origin check. Nothing is uploaded and the result stays in your browser.</p>
-      <button id="run" type="button">Run network check</button>
+    <section class="hero wrap">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="pulse"></span> Independent edge observatory</p>
+        <h1>See the route.<br><em>Know the signal.</em></h1>
+        <p class="lead">A private, same-origin view of endpoint reachability, response time and browser network state. No account, tracking or third-party requests.</p>
+        <div class="hero-actions"><button id="run" type="button">Run live check</button><a class="button ghost" href="/about.html">How it works</a></div>
+        <div class="trust-row"><span>Same-origin only</span><span>No cookies</span><span>Open methodology</span></div>
+      </div>
+      <aside class="signal-card" aria-label="Live endpoint signal">
+        <div class="signal-head"><span>Live signal</span><span id="result" class="status"><i></i> Initialising</span></div>
+        <div class="orbital" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="core"><span id="latencyBig">—</span><small>median ms</small></div></div>
+        <div class="signal-foot"><span><small>Endpoint</small><strong id="host">checking…</strong></span><span><small>Last sample</small><strong id="checked">pending</strong></span></div>
+      </aside>
     </section>
-    <section class="panel" aria-live="polite">
-      <div><span class="label">Endpoint</span><strong id="host">checking…</strong></div>
-      <div><span class="label">Browser network</span><strong id="online">checking…</strong></div>
-      <div><span class="label">HTTPS</span><strong id="secure">checking…</strong></div>
-      <div><span class="label">Median response</span><strong id="latency">not measured</strong></div>
-      <div><span class="label">Last check</span><strong id="checked">not measured</strong></div>
-      <div><span class="label">Result</span><strong id="result" class="status">ready</strong></div>
+    <section class="metric-strip wrap" aria-live="polite">
+      <article><span class="metric-icon">↯</span><div><small>Median response</small><strong id="latency">Not measured</strong></div></article>
+      <article><span class="metric-icon">≋</span><div><small>Sample jitter</small><strong id="jitter">Not measured</strong></div></article>
+      <article><span class="metric-icon">⌁</span><div><small>Browser network</small><strong id="online">Checking</strong></div></article>
+      <article><span class="metric-icon">◇</span><div><small>Secure context</small><strong id="secure">Checking</strong></div></article>
     </section>
-    <section class="note"><h2>What this tells you</h2><p>The test measures access to this endpoint over your current route. It does not inspect traffic, install software, or claim that every destination is reachable.</p><button id="copy" class="secondary" type="button">Copy report</button></section>
+    <section class="workspace wrap">
+      <article class="chart-card">
+        <div class="section-head"><div><p class="eyebrow">Current session</p><h2>Response timeline</h2></div><span class="legend"><i></i> browser observed</span></div>
+        <div id="timeline" class="timeline" role="img" aria-label="Response-time samples"><span class="empty-chart">Run a check to populate the timeline</span></div>
+        <div class="chart-axis"><span>oldest</span><span>latest</span></div>
+      </article>
+      <aside class="checks-card">
+        <p class="eyebrow">Checks</p><h2>Endpoint layers</h2>
+        <ul class="checks">
+          <li><span class="check-icon" data-check="dns">1</span><div><strong>Hostname</strong><small id="dnsState">Resolving current origin</small></div></li>
+          <li><span class="check-icon" data-check="tls">2</span><div><strong>Secure transport</strong><small id="tlsState">Verifying browser context</small></div></li>
+          <li><span class="check-icon" data-check="http">3</span><div><strong>Origin response</strong><small id="httpState">Waiting for live sample</small></div></li>
+        </ul>
+        <a class="text-link" href="/status.html">View detailed status <span>→</span></a>
+      </aside>
+    </section>
+    <section class="principles wrap">
+      <div class="section-head"><div><p class="eyebrow">Designed for clarity</p><h2>Useful signal, minimal footprint.</h2></div><p>Every measurement is generated locally in this tab against the hostname already open in your browser.</p></div>
+      <div class="feature-grid">
+        <article><b>01</b><h3>Same-origin probes</h3><p>The check requests a tiny local health object. It contacts no analytics, ad network or external API.</p></article>
+        <article><b>02</b><h3>Honest boundaries</h3><p>A green result confirms this endpoint at this moment—not the health of the entire internet.</p></article>
+        <article><b>03</b><h3>Session-only data</h3><p>Samples remain in page memory and disappear when the tab closes. Nothing is uploaded.</p></article>
+      </div>
+    </section>
   </main>
-  <footer>Northstar Network Check · <a href="/about.html">Privacy and method</a></footer>
+  <footer><div class="wrap footer-grid"><div><a class="brand" href="/"><span class="brand-mark">N</span><span>Northstar</span></a><p>Independent browser-side endpoint diagnostics.</p></div><div><strong>Explore</strong><a href="/status.html">Live status</a><a href="/about.html">Method</a><a href="/health.txt">Raw health</a></div><div><strong>Principles</strong><span>No analytics</span><span>No accounts</span><span>No third parties</span></div></div><div class="wrap footer-bottom"><span>Northstar Edge Observatory</span><span id="year"></span></div></footer>
   <script src="/diagnostics.js" defer></script>
 </body>
 </html>
 EOF
     cat >"${INSTALL_DIR}/site/about.html" <<'EOF'
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/site.css"><title>About · Northstar</title></head><body><header class="nav"><a class="brand" href="/">Northstar</a></header><main><article class="note prose"><p class="eyebrow">About</p><h1>A deliberately small network check</h1><p>Northstar requests a tiny local health file several times and reports the median browser-observed response time. The page uses no third-party scripts, analytics, cookies, accounts or browser storage.</p><h2>Limits</h2><p>A successful result proves only that this hostname is reachable at that moment. A failed result can be caused by the local connection, routing, DNS, filtering, or endpoint maintenance.</p><p><a href="/">Return to the check</a></p></article></main><footer>Northstar Network Check</footer></body></html>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#071018"><meta name="description" content="Northstar measurement and privacy methodology"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/site.css"><title>Method · Northstar</title></head><body><header class="nav wrap"><a class="brand" href="/"><span class="brand-mark">N</span><span>Northstar</span></a><nav><a href="/">Overview</a><a href="/status.html">Status</a><a class="active" href="/about.html">Method</a></nav></header><main class="article-shell wrap"><div class="article-title"><p class="eyebrow">Open methodology</p><h1>Small probes.<br><em>Clear limits.</em></h1><p>Northstar is a self-contained browser diagnostic for the endpoint serving this page. Its job is to expose a useful local signal without pretending to be a global monitoring network.</p></div><article class="prose"><h2>What happens during a check</h2><p>The page requests <code>/health.txt</code> seven times with caching disabled. The browser measures each completed round trip. Northstar reports the median, approximate jitter and the slowest observed sample.</p><h2>What never happens</h2><p>There are no third-party scripts, analytics pixels, advertising calls, accounts or telemetry uploads. Results remain in JavaScript memory for the life of the page and are discarded when it closes.</p><div class="callout"><strong>Scope of a green result</strong><p>It confirms that DNS, a secure browser connection and this origin worked from this browser at that moment. It does not certify unrelated destinations or every network path.</p></div><h2>Why results can change</h2><p>Access networks, DNS caches, radio conditions, congestion and route selection all vary. A single measurement is a snapshot. Repeat checks and compare from the same access network before drawing conclusions.</p><h2>Data returned by the origin</h2><p>The health object contains only the text <code>ok</code>. Standard web-server access logs may contain ordinary request metadata needed for operations; the page itself adds no identifier.</p><p><a class="button" href="/">Run the live check</a></p></article></main><footer><div class="wrap footer-bottom"><span>Northstar Edge Observatory</span><span>Methodology</span></div></footer></body></html>
+EOF
+    cat >"${INSTALL_DIR}/site/status.html" <<'EOF'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#071018"><meta name="description" content="Live Northstar endpoint status"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/site.css"><title>Status · Northstar</title></head><body><header class="nav wrap"><a class="brand" href="/"><span class="brand-mark">N</span><span>Northstar</span></a><nav><a href="/">Overview</a><a class="active" href="/status.html">Status</a><a href="/about.html">Method</a></nav></header><main class="status-page wrap"><section class="status-title"><p class="eyebrow"><span class="pulse"></span> Browser-side status</p><h1>Live endpoint<br><em>diagnostics.</em></h1><p>Run a fresh same-origin sample from this device and network.</p><button id="run" type="button">Run all checks</button></section><section class="status-banner"><div><span id="result" class="status"><i></i> Initialising</span><h2 id="bannerTitle">Preparing endpoint check</h2><p id="bannerText">No result has been recorded in this tab yet.</p></div><div class="banner-metric"><strong id="latencyBig">—</strong><span>median ms</span></div></section><section class="component-list"><article><span class="component-dot" data-check="dns"></span><div><h3>Hostname resolution</h3><p id="dnsState">Resolving current origin</p></div><strong id="host">checking…</strong></article><article><span class="component-dot" data-check="tls"></span><div><h3>HTTPS secure context</h3><p id="tlsState">Verifying browser context</p></div><strong id="secure">checking…</strong></article><article><span class="component-dot" data-check="http"></span><div><h3>Origin health object</h3><p id="httpState">Waiting for samples</p></div><strong id="online">checking…</strong></article></section><section class="report-card"><div><p class="eyebrow">Latest sample</p><h2>Diagnostic report</h2></div><dl><div><dt>Median</dt><dd id="latency">Not measured</dd></div><div><dt>Jitter</dt><dd id="jitter">Not measured</dd></div><div><dt>Checked</dt><dd id="checked">Pending</dd></div></dl><button id="copy" class="ghost" type="button">Copy report</button></section><div id="timeline" class="timeline compact" aria-label="Response-time samples"><span class="empty-chart">Run a check to populate the timeline</span></div></main><footer><div class="wrap footer-bottom"><span>Northstar Edge Observatory</span><a href="/about.html">Measurement limits</a></div></footer><script src="/diagnostics.js" defer></script></body></html>
 EOF
     cat >"${INSTALL_DIR}/site/404.html" <<'EOF'
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/site.css"><title>Not found · Northstar</title></head><body><main><article class="note prose"><p class="eyebrow">404</p><h1>That route is not here.</h1><p>The endpoint is online, but the requested resource does not exist.</p><p><a href="/">Return home</a></p></article></main></body></html>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#071018"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/site.css"><title>Not found · Northstar</title></head><body><main class="error-page"><div class="error-orbit"><span>404</span></div><p class="eyebrow">Route unavailable</p><h1>This coordinate<br>is not on the map.</h1><p>The endpoint is online, but the requested resource does not exist.</p><a class="button" href="/">Return to overview</a></main></body></html>
 EOF
     cat >"${INSTALL_DIR}/site/site.css" <<'EOF'
-:root{color-scheme:light dark;--bg:#07111f;--panel:#0f2034;--line:#24415f;--text:#eaf3ff;--muted:#9bb0c7;--accent:#5ee6b0;--ink:#061811}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,#183b5c 0,transparent 34rem),var(--bg);color:var(--text);font:16px/1.6 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.nav,main,footer{width:min(1040px,calc(100% - 40px));margin:auto}.nav{height:76px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.nav nav{display:flex;gap:22px}.brand{font-weight:800;letter-spacing:.08em;text-transform:uppercase}.nav a,footer a,.note a{color:var(--text);text-decoration:none}.hero{padding:88px 0 42px;max-width:740px}.eyebrow{color:var(--accent);font-size:.78rem;font-weight:800;letter-spacing:.16em;text-transform:uppercase}h1{font-size:clamp(2.6rem,8vw,5.4rem);line-height:.98;letter-spacing:-.045em;margin:.25em 0}.lead{font-size:1.18rem;color:var(--muted);max-width:650px}button{border:0;border-radius:999px;padding:13px 20px;background:var(--accent);color:var(--ink);font:inherit;font-weight:800;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.secondary{background:transparent;color:var(--text);border:1px solid var(--line)}.panel{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line);border-radius:24px;overflow:hidden;background:color-mix(in srgb,var(--panel) 88%,transparent)}.panel>div{padding:22px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.panel>div:nth-child(3n){border-right:0}.panel>div:nth-last-child(-n+3){border-bottom:0}.label{display:block;color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.08em}.panel strong{display:block;margin-top:8px;overflow-wrap:anywhere}.status.good{color:var(--accent)}.status.bad{color:#ff8a8a}.note{margin:32px 0 90px;padding:28px;border:1px solid var(--line);border-radius:20px;background:var(--panel)}.note h2{margin-top:0}.prose{max-width:760px;margin-top:72px}.prose h1{font-size:clamp(2.4rem,7vw,4.5rem)}footer{padding:28px 0 42px;color:var(--muted);border-top:1px solid var(--line)}@media(max-width:720px){.nav nav{display:none}.hero{padding-top:56px}.panel{grid-template-columns:1fr 1fr}.panel>div,.panel>div:nth-child(3n),.panel>div:nth-last-child(-n+3){border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.panel>div:nth-child(2n){border-right:0}.panel>div:nth-last-child(-n+2){border-bottom:0}}
+:root{color-scheme:dark;--bg:#071018;--bg2:#0a151f;--panel:#0d1b26;--panel2:#102431;--line:#203541;--line2:#2b4653;--text:#eef7f4;--muted:#90a6aa;--accent:#81f4c1;--accent2:#5dc7ff;--danger:#ff8d8d;--ink:#04140d;--shadow:0 24px 70px rgba(0,0,0,.28)}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-height:100vh;overflow-x:hidden;background:var(--bg);color:var(--text);font:15px/1.65 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.24;background-image:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px);background-size:56px 56px}.ambient{position:fixed;border-radius:50%;filter:blur(120px);pointer-events:none;opacity:.15}.ambient-a{width:520px;height:520px;right:-190px;top:-170px;background:var(--accent2)}.ambient-b{width:430px;height:430px;left:-220px;top:420px;background:var(--accent)}.wrap{width:min(1180px,calc(100% - 48px));margin-inline:auto}a{color:inherit}.nav{height:84px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,.09);position:relative;z-index:5}.brand{display:inline-flex;align-items:center;gap:11px;color:var(--text);text-decoration:none;font-size:.84rem;font-weight:850;letter-spacing:.14em;text-transform:uppercase}.brand-mark{display:grid;place-items:center;width:32px;height:32px;border:1px solid rgba(129,244,193,.5);border-radius:10px;color:var(--accent);background:rgba(129,244,193,.07);font-size:.82rem}.nav nav{display:flex;gap:32px}.nav nav a{position:relative;color:var(--muted);text-decoration:none;font-size:.88rem;font-weight:650;transition:.2s}.nav nav a:hover,.nav nav a.active{color:var(--text)}.nav nav a.active:after{content:"";position:absolute;left:0;right:0;bottom:-31px;height:2px;background:var(--accent)}.nav-action{padding:9px 14px;border:1px solid var(--line2);border-radius:10px;text-decoration:none;font-size:.8rem;font-weight:750}.nav-action span{color:var(--accent)}.hero{position:relative;z-index:1;display:grid;grid-template-columns:minmax(0,1.18fr) minmax(330px,.82fr);gap:70px;align-items:center;padding-block:112px 88px}.eyebrow{margin:0 0 15px;color:var(--accent);font-size:.72rem;font-weight:850;letter-spacing:.17em;text-transform:uppercase}.pulse{display:inline-block;width:7px;height:7px;margin-right:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 6px rgba(129,244,193,.09);animation:pulse 2s infinite}.hero h1,.article-title h1,.status-title h1{margin:0;font-size:clamp(3.4rem,7.6vw,6.7rem);line-height:.91;letter-spacing:-.065em;font-weight:720}.hero h1 em,.article-title h1 em,.status-title h1 em{color:var(--accent);font-style:normal;font-weight:450}.lead{max-width:650px;margin:30px 0;color:#adbec0;font-size:1.1rem;line-height:1.75}.hero-actions{display:flex;gap:12px;margin-top:30px}.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 21px;border:0;border-radius:12px;background:var(--accent);color:var(--ink);font:inherit;font-weight:850;text-decoration:none;cursor:pointer;transition:transform .2s,filter .2s}button:hover,.button:hover{transform:translateY(-2px);filter:brightness(1.04)}button:disabled{opacity:.6;cursor:wait;transform:none}.ghost{border:1px solid var(--line2);background:rgba(255,255,255,.025);color:var(--text)}.trust-row{display:flex;flex-wrap:wrap;gap:22px;margin-top:28px;color:var(--muted);font-size:.76rem}.trust-row span:before{content:"✓";margin-right:6px;color:var(--accent)}.signal-card{min-height:480px;padding:25px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(145deg,rgba(16,36,49,.9),rgba(9,23,33,.9));box-shadow:var(--shadow);backdrop-filter:blur(12px)}.signal-head,.signal-foot{display:flex;justify-content:space-between;gap:20px}.signal-head>span:first-child{font-size:.76rem;color:var(--muted);letter-spacing:.1em;text-transform:uppercase}.status{display:inline-flex;align-items:center;gap:8px;color:var(--muted);font-size:.76rem;font-weight:750}.status i{width:7px;height:7px;border-radius:50%;background:currentColor}.status.good{color:var(--accent)}.status.bad{color:var(--danger)}.orbital{position:relative;width:285px;height:285px;margin:36px auto;display:grid;place-items:center}.orbit{position:absolute;border:1px solid rgba(129,244,193,.18);border-radius:50%}.orbit-one{inset:10px;border-style:dashed;animation:spin 28s linear infinite}.orbit-two{inset:42px;border-color:rgba(93,199,255,.22);animation:spin 18s linear infinite reverse}.orbit:after{content:"";position:absolute;width:9px;height:9px;top:20px;left:50%;border-radius:50%;background:var(--accent);box-shadow:0 0 18px var(--accent)}.core{width:150px;height:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;border:1px solid var(--line2);border-radius:50%;background:radial-gradient(circle,rgba(129,244,193,.09),transparent 70%)}.core span{font-size:3.3rem;line-height:1;font-weight:720;letter-spacing:-.06em}.core small{margin-top:8px;color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.1em}.signal-foot{padding-top:19px;border-top:1px solid var(--line)}.signal-foot span{min-width:0}.signal-foot small,.metric-strip small{display:block;color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}.signal-foot strong{display:block;max-width:190px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;font-size:.83rem}.metric-strip{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:20px;background:rgba(13,27,38,.76);overflow:hidden}.metric-strip article{display:flex;align-items:center;gap:14px;padding:23px;border-right:1px solid var(--line)}.metric-strip article:last-child{border:0}.metric-icon{display:grid;place-items:center;width:36px;height:36px;border:1px solid var(--line2);border-radius:10px;color:var(--accent)}.metric-strip strong{display:block;margin-top:3px;font-size:.95rem}.workspace{display:grid;grid-template-columns:1.65fr .85fr;gap:20px;padding-block:90px}.chart-card,.checks-card,.report-card{border:1px solid var(--line);border-radius:22px;background:var(--panel);box-shadow:0 20px 60px rgba(0,0,0,.14)}.chart-card{padding:28px}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:30px}.section-head h2,.checks-card h2,.report-card h2{margin:0;font-size:1.55rem;letter-spacing:-.035em}.legend{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:.72rem}.legend i{width:7px;height:7px;border-radius:50%;background:var(--accent2)}.timeline{height:210px;display:flex;align-items:flex-end;gap:7px;margin-top:32px;padding:22px 14px 0;border-bottom:1px solid var(--line);background:repeating-linear-gradient(to bottom,transparent 0,transparent 51px,rgba(255,255,255,.035) 52px)}.timeline.compact{height:150px;margin:30px 0 80px}.timeline-bar{position:relative;flex:1;min-width:7px;max-width:32px;height:var(--h);min-height:4px;border-radius:5px 5px 1px 1px;background:linear-gradient(to top,var(--accent2),var(--accent));transform-origin:bottom;animation:grow .6s both}.timeline-bar:hover:after{content:attr(data-value);position:absolute;bottom:calc(100% + 7px);left:50%;transform:translateX(-50%);padding:3px 7px;border:1px solid var(--line2);border-radius:6px;background:var(--bg2);font-size:.66rem;white-space:nowrap}.empty-chart{align-self:center;margin:auto;color:var(--muted);font-size:.78rem}.chart-axis{display:flex;justify-content:space-between;margin-top:8px;color:#60777d;font-size:.65rem;text-transform:uppercase;letter-spacing:.1em}.checks-card{padding:28px}.checks{list-style:none;margin:26px 0 22px;padding:0}.checks li{display:flex;align-items:center;gap:14px;padding:17px 0;border-bottom:1px solid var(--line)}.check-icon{display:grid;place-items:center;flex:0 0 34px;height:34px;border:1px solid var(--line2);border-radius:50%;color:var(--muted);font-size:.72rem}.check-icon.pass{border-color:rgba(129,244,193,.45);background:rgba(129,244,193,.07);color:var(--accent)}.check-icon.fail{border-color:rgba(255,141,141,.45);color:var(--danger)}.checks strong,.checks small{display:block}.checks strong{font-size:.87rem}.checks small{color:var(--muted);font-size:.73rem}.text-link{display:flex;justify-content:space-between;color:var(--text);text-decoration:none;font-size:.8rem;font-weight:750}.text-link span{color:var(--accent)}.principles{padding-bottom:112px}.principles>.section-head{padding-bottom:32px;border-bottom:1px solid var(--line)}.principles>.section-head h2{max-width:580px;font-size:clamp(2.2rem,4vw,3.6rem);line-height:1.05}.principles>.section-head>p{max-width:390px;margin:20px 0 0;color:var(--muted)}.feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:28px}.feature-grid article{padding:25px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,rgba(16,36,49,.58),rgba(8,20,29,.58))}.feature-grid b{color:var(--accent);font-size:.69rem;letter-spacing:.1em}.feature-grid h3{margin:30px 0 8px;font-size:1.05rem}.feature-grid p{margin:0;color:var(--muted);font-size:.84rem}footer{position:relative;border-top:1px solid var(--line);background:#060d13;color:var(--muted)}.footer-grid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:80px;padding-block:55px}.footer-grid>div{display:flex;flex-direction:column;align-items:flex-start;gap:7px}.footer-grid p{max-width:300px}.footer-grid strong{margin-bottom:7px;color:var(--text);font-size:.74rem;text-transform:uppercase;letter-spacing:.1em}.footer-grid a:not(.brand){color:var(--muted);text-decoration:none}.footer-bottom{display:flex;justify-content:space-between;padding-block:20px;border-top:1px solid #172731;font-size:.72rem}.footer-bottom a{color:var(--muted)}.article-shell{display:grid;grid-template-columns:1fr 1fr;gap:110px;padding-block:105px}.article-title{position:sticky;top:55px;align-self:start}.article-title h1{font-size:clamp(3.1rem,6vw,5.8rem)}.article-title>p:last-child{max-width:520px;color:var(--muted);font-size:1rem}.prose{max-width:680px}.prose h2{margin:48px 0 12px;font-size:1.45rem}.prose h2:first-child{margin-top:0}.prose p{color:#adbdc0}.prose code{padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--accent)}.callout{margin:38px 0;padding:22px;border-left:2px solid var(--accent);background:rgba(129,244,193,.055)}.callout p{margin-bottom:0}.status-page{padding-block:85px}.status-title{display:grid;grid-template-columns:1fr auto;align-items:end;margin-bottom:55px}.status-title h1{grid-column:1;font-size:clamp(3.3rem,7vw,6.2rem)}.status-title>p:last-of-type{grid-column:1;max-width:570px;color:var(--muted)}.status-title button{grid-column:2;grid-row:1/4}.status-banner{display:flex;justify-content:space-between;align-items:center;padding:34px;border:1px solid var(--line2);border-radius:24px;background:linear-gradient(120deg,rgba(129,244,193,.07),rgba(93,199,255,.06))}.status-banner h2{margin:15px 0 3px;font-size:1.7rem}.status-banner p{margin:0;color:var(--muted)}.banner-metric{text-align:right}.banner-metric strong{display:block;font-size:3.7rem;line-height:1;letter-spacing:-.06em}.banner-metric span{color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.1em}.component-list{margin:24px 0}.component-list article{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:17px;padding:24px;border-bottom:1px solid var(--line)}.component-list h3,.component-list p{margin:0}.component-list h3{font-size:.98rem}.component-list p{color:var(--muted);font-size:.78rem}.component-list>article>strong{font-size:.83rem}.component-dot{width:10px;height:10px;border-radius:50%;background:#52666c}.component-dot.pass{background:var(--accent);box-shadow:0 0 0 6px rgba(129,244,193,.08)}.component-dot.fail{background:var(--danger)}.report-card{display:grid;grid-template-columns:1fr 2fr auto;align-items:center;gap:30px;padding:28px}.report-card dl{display:grid;grid-template-columns:repeat(3,1fr);gap:25px;margin:0}.report-card dl div{border-left:1px solid var(--line);padding-left:20px}.report-card dt{color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}.report-card dd{margin:5px 0 0;font-weight:750}.error-page{width:min(720px,calc(100% - 40px));min-height:100vh;margin:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}.error-page h1{margin:0;font-size:clamp(3rem,8vw,6rem);line-height:.95;letter-spacing:-.06em}.error-page>p:not(.eyebrow){color:var(--muted)}.error-orbit{width:180px;height:180px;margin-bottom:30px;display:grid;place-items:center;border:1px dashed var(--line2);border-radius:50%;animation:spin 30s linear infinite}.error-orbit span{display:grid;place-items:center;width:105px;height:105px;border:1px solid var(--line);border-radius:50%;color:var(--accent);font-size:1.3rem;animation:spin 30s linear infinite reverse}@keyframes pulse{50%{opacity:.45;box-shadow:0 0 0 10px rgba(129,244,193,0)}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes grow{from{transform:scaleY(0)}}@media(max-width:900px){.hero{grid-template-columns:1fr;gap:48px;padding-top:75px}.signal-card{min-height:auto}.metric-strip{grid-template-columns:1fr 1fr}.metric-strip article:nth-child(2){border-right:0}.metric-strip article:nth-child(-n+2){border-bottom:1px solid var(--line)}.workspace{grid-template-columns:1fr}.article-shell{grid-template-columns:1fr;gap:45px}.article-title{position:static}.status-title{display:block}.status-title button{margin-top:20px}.report-card{grid-template-columns:1fr}.report-card dl{order:2}.report-card button{order:3}.feature-grid{grid-template-columns:1fr}.footer-grid{grid-template-columns:1fr 1fr}.footer-grid>div:first-child{grid-column:1/-1}}@media(max-width:640px){.wrap{width:min(100% - 28px,1180px)}.nav{height:70px}.nav nav,.nav-action{display:none}.hero{padding-block:60px}.hero h1{font-size:clamp(3rem,16vw,4.5rem)}.hero-actions{align-items:stretch;flex-direction:column}.signal-card{padding:20px}.orbital{width:245px;height:245px}.metric-strip{grid-template-columns:1fr}.metric-strip article{border-right:0;border-bottom:1px solid var(--line)}.metric-strip article:nth-child(2){border-bottom:1px solid var(--line)}.workspace{padding-block:60px}.section-head{display:block}.legend{margin-top:10px}.principles>.section-head>p{max-width:none}.footer-grid{grid-template-columns:1fr;gap:30px}.footer-grid>div:first-child{grid-column:auto}.footer-bottom{gap:20px}.status-page{padding-block:55px}.status-banner{align-items:flex-start;gap:30px}.banner-metric strong{font-size:2.5rem}.component-list article{grid-template-columns:auto 1fr}.component-list>article>strong{grid-column:2}.report-card dl{grid-template-columns:1fr}.report-card dl div{border-left:0;border-top:1px solid var(--line);padding:10px 0 0}.article-shell{padding-block:65px}}
 EOF
     cat >"${INSTALL_DIR}/site/diagnostics.js" <<'EOF'
-const $=id=>document.getElementById(id), report={};
-function set(id,value){$(id).textContent=value;report[id]=value}
-function localState(){set('host',location.hostname);set('online',navigator.onLine?'online':'offline');set('secure',isSecureContext?'secure context':'not secure')}
-async function run(){const button=$('run');button.disabled=true;set('result','running');$('result').className='status';const samples=[];try{for(let i=0;i<5;i++){const start=performance.now();const response=await fetch('/health.txt?probe='+Date.now(),{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);await response.text();samples.push(performance.now()-start)}samples.sort((a,b)=>a-b);set('latency',Math.round(samples[2])+' ms');set('checked',new Date().toLocaleString());set('result','healthy');$('result').className='status good'}catch(error){set('latency','unavailable');set('checked',new Date().toLocaleString());set('result','failed: '+error.message);$('result').className='status bad'}finally{button.disabled=false}}
-$('run').addEventListener('click',run);$('copy').addEventListener('click',async()=>{const text=['Northstar network report',...Object.entries(report).map(([k,v])=>k+': '+v)].join('\n');try{await navigator.clipboard.writeText(text);$('copy').textContent='Copied'}catch{$('copy').textContent='Copy unavailable'}});addEventListener('online',localState);addEventListener('offline',localState);localState();run();
+(()=>{'use strict';const report={},history=[],$=id=>document.getElementById(id),all=s=>[...document.querySelectorAll(s)];function set(id,value){const node=$(id);if(node)node.textContent=value;report[id]=value}function mark(name,state){all(`[data-check="${name}"]`).forEach(node=>{node.classList.remove('pass','fail');if(state)node.classList.add(state)})}function localState(){const online=navigator.onLine;set('host',location.hostname);set('online',online?'Online':'Offline');set('secure',isSecureContext?'Verified HTTPS':'Not secure');set('dnsState',location.hostname?'Origin hostname available':'Hostname unavailable');set('tlsState',isSecureContext?'Secure browser context':'Secure context unavailable');mark('dns',location.hostname?'pass':'fail');mark('tls',isSecureContext?'pass':'fail')}function draw(samples){const root=$('timeline');if(!root)return;root.replaceChildren();samples.forEach((sample,index)=>{const bar=document.createElement('span');const max=Math.max(...samples,1);bar.className='timeline-bar';bar.style.setProperty('--h',`${Math.max(5,Math.round(sample/max*100))}%`);bar.style.animationDelay=`${index*55}ms`;bar.dataset.value=`${Math.round(sample)} ms`;root.append(bar)})}function status(text,state){const node=$('result');if(!node)return;node.className=`status ${state||''}`;node.replaceChildren();const dot=document.createElement('i');node.append(dot,document.createTextNode(text))}async function run(){const button=$('run');if(button)button.disabled=true;status('Running checks');set('httpState','Collecting seven fresh samples');const samples=[];try{for(let i=0;i<7;i++){const start=performance.now();const response=await fetch(`/health.txt?probe=${Date.now()}-${i}`,{cache:'no-store',credentials:'same-origin'});if(!response.ok)throw new Error(`HTTP ${response.status}`);const body=(await response.text()).trim();if(body!=='ok')throw new Error('Unexpected health response');samples.push(performance.now()-start)}const ordered=[...samples].sort((a,b)=>a-b),median=ordered[Math.floor(ordered.length/2)],jitter=ordered.reduce((sum,value)=>sum+Math.abs(value-median),0)/ordered.length,slowest=ordered.at(-1);history.push(...samples);if(history.length>28)history.splice(0,history.length-28);set('latency',`${Math.round(median)} ms`);set('latencyBig',String(Math.round(median)));set('jitter',`${Math.round(jitter)} ms`);set('checked',new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}));set('httpState',`7/7 responses · slowest ${Math.round(slowest)} ms`);set('bannerTitle','Endpoint is reachable');set('bannerText','All same-origin browser checks completed successfully.');status('Operational','good');mark('http','pass');draw(history)}catch(error){set('latency','Unavailable');set('latencyBig','—');set('jitter','Unavailable');set('checked',new Date().toLocaleTimeString());set('httpState',`Check failed · ${error.message}`);set('bannerTitle','Endpoint check failed');set('bannerText','The browser could not complete the same-origin health request.');status('Unavailable','bad');mark('http','fail')}finally{if(button)button.disabled=false}}async function copy(){const button=$('copy'),text=['Northstar endpoint report',`origin: ${location.origin}`,...Object.entries(report).map(([key,value])=>`${key}: ${value}`)].join('\n');try{await navigator.clipboard.writeText(text);button.textContent='Copied to clipboard'}catch{button.textContent='Copy unavailable'}}const runButton=$('run'),copyButton=$('copy');if(runButton)runButton.addEventListener('click',run);if(copyButton)copyButton.addEventListener('click',copy);addEventListener('online',localState);addEventListener('offline',localState);document.addEventListener('visibilitychange',()=>{if(!document.hidden&&history.length)run()});set('year',String(new Date().getFullYear()));localState();run()})();
 EOF
     cat >"${INSTALL_DIR}/site/favicon.svg" <<'EOF'
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0f2034"/><path d="M32 7l5.7 18.7L57 32l-19.3 6.3L32 57l-5.7-18.7L7 32l19.3-6.3z" fill="#5ee6b0"/><circle cx="32" cy="32" r="5" fill="#07111f"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="17" fill="#0d1b26"/><circle cx="32" cy="32" r="20" fill="none" stroke="#274653"/><path d="M17 44V20l30 24V20" fill="none" stroke="#81f4c1" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="47" cy="20" r="4" fill="#5dc7ff"/></svg>
+EOF
+    cat >"${INSTALL_DIR}/site/site.webmanifest" <<'EOF'
+{"name":"Northstar Edge Observatory","short_name":"Northstar","start_url":"/","display":"standalone","background_color":"#071018","theme_color":"#071018","icons":[{"src":"/favicon.svg","sizes":"any","type":"image/svg+xml"}]}
 EOF
     cat >"${INSTALL_DIR}/site/robots.txt" <<'EOF'
 User-agent: *
@@ -1426,6 +1470,10 @@ Remnawave 2.8.1 subscription settings
 3. Do not add a new Happ/INCY rule for this deployment.
 4. Keep happRouting empty; routing and DNS are in the XRAY_JSON template.
 5. Test with the normal base subscription URL, not a forced /json suffix.
+6. The template sends Russian services, selected game ports and detected
+   BitTorrent DIRECT from the client. Those destinations see the client's real
+   public IP. Remove the DIRECT rules if a squad requires strict full-tunnel
+   privacy instead of local-RU reachability and latency.
 EOF
     chmod 0600 "${PRIVATE_DIR}/SUBSCRIPTION-SETTINGS.txt"
 }
@@ -1522,7 +1570,66 @@ render_auto_template() {
       {"type": "field", "inboundTag": ["dns-internal"], "balancerTag": "RU_AUTO"},
       {"type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out"},
       {"type": "field", "network": "tcp,udp", "port": 53, "outboundTag": "dns-out"},
-      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"},
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "port": "27015-27059,3478,4379-4380",
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "geosite:category-ru",
+          "geosite:steam",
+          "geosite:twitch",
+          "geosite:apple",
+          "geosite:xiaomi",
+          "geosite:huawei",
+          "geosite:category-android-app-download",
+          "geosite:mailru-group",
+          "geosite:yandex",
+          "geosite:wildberries",
+          "geosite:ozon",
+          "geosite:avito",
+          "geosite:x5",
+          "domain:2gis.com",
+          "domain:2gis.ae",
+          "domain:2gis.kz",
+          "domain:2gis.uz",
+          "domain:vk.com",
+          "domain:userapi.com",
+          "domain:vk-cdn.net",
+          "domain:vkuser.net",
+          "domain:vkuservideo.net",
+          "domain:mycdn.me",
+          "domain:yandex.com",
+          "domain:yandex.net",
+          "domain:yandexcloud.net",
+          "domain:yastatic.net",
+          "domain:sberbank.com",
+          "domain:tinkoff-group.com",
+          "domain:tinkoff.cloud",
+          "domain:ozon.com",
+          "domain:ozonusercontent.com",
+          "domain:wildberries.com",
+          "domain:wbcontent.net",
+          "domain:wbstatic.net",
+          "domain:avito.st",
+          "domain:samokat.tech",
+          "domain:ecom.tech",
+          "domain:goldapple.by",
+          "domain:goldapple.kz",
+          "domain:goldapple.ae",
+          "domain:goldapple.sa",
+          "domain:goldapple.qa",
+          "domain:megamarket.tech",
+          "domain:kuper.tech",
+          "domain:x5.tech"
+        ],
+        "outboundTag": "direct"
+      },
+      {"type": "field", "ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct"},
       {"type": "field", "network": "tcp,udp", "balancerTag": "RU_AUTO"}
     ]
   },
@@ -1537,7 +1644,7 @@ render_auto_template() {
         ]
       }
     },
-    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
     {"tag": "block", "protocol": "blackhole"}
   ]
 }
@@ -1981,7 +2088,7 @@ validate_auto_template_model() {
 
 validate_artifacts() {
     local caddy_output caddy_json node_compose_json edge_compose_json xray_validation_config=''
-    local expected_inbounds=0 expected_hosts=0
+    local expected_inbounds=0 expected_hosts=0 site_bytes required_site_file
     local -a caddy_subjects=("${REALITY_SNI}") xray_server_mounts=() material=()
     log 'Validating strict JSON, pinned Xray, Compose, HAProxy and Caddy...'
     jq empty "${PRIVATE_DIR}/config-profile.ready.json"
@@ -1999,6 +2106,19 @@ validate_artifacts() {
         die 'FinalMask fragment must use the Happ-compatible singular length/delay schema.'
     [[ ! -f "${PRIVATE_DIR}/xray-json-auto.ready.json" ]] || \
         jq empty "${PRIVATE_DIR}/xray-json-auto.ready.json"
+
+    for required_site_file in index.html status.html about.html 404.html \
+      site.css diagnostics.js favicon.svg site.webmanifest health.txt robots.txt; do
+        [[ -s "${INSTALL_DIR}/site/${required_site_file}" ]] || \
+            die "Cover site is missing ${required_site_file}."
+    done
+    site_bytes="$(du -sb "${INSTALL_DIR}/site" | awk '{print $1}')"
+    [[ "${site_bytes}" =~ ^[0-9]+$ ]] || die 'Could not measure cover-site payload.'
+    ((site_bytes <= 41943040)) || die 'Cover-site payload exceeds the 40 MiB budget.'
+    if grep -RIE "<(script|link|img)[^>]+(src|href)=[\"']https?://" \
+      "${INSTALL_DIR}/site" >/dev/null; then
+        die 'Cover site must not load third-party scripts, styles or images.'
+    fi
 
     ((expected_inbounds += ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA))
     ((expected_hosts += ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA))
@@ -2090,12 +2210,32 @@ validate_artifacts() {
       .remnawave.injectHosts[0].selector.type == "remarkRegex" and
       (.remnawave.injectHosts[0].selector.pattern | startswith("^RW ")) and
       .routing.balancers[0].strategy.type == "leastPing" and
+      ([.routing.rules[] | select(
+        .outboundTag == "direct" and .protocol == ["bittorrent"]
+      )] | length == 1) and
+      ([.routing.rules[] | select(
+        .outboundTag == "direct" and
+        .port == "27015-27059,3478,4379-4380"
+      )] | length == 1) and
+      ([.routing.rules[] | select(
+        .outboundTag == "direct" and
+        (.domain // [] | index("geosite:category-ru")) != null and
+        (.domain // [] | index("domain:samokat.tech")) != null and
+        (.domain // [] | index("domain:goldapple.kz")) != null
+      )] | length == 1) and
+      ([.routing.rules[] | select(
+        .outboundTag == "direct" and .ip == ["geoip:ru", "geoip:private"]
+      )] | length == 1) and
+      ([.outbounds[] | select(
+        .tag == "direct" and .protocol == "freedom" and
+        .settings.domainStrategy == "UseIPv4"
+      )] | length == 1) and
       (.dns.servers | length == 3) and
       (.dns.servers[0].address | startswith("https://")) and
       (.dns.servers[1].address | startswith("https://")) and
       .dns.servers[2].address == "fakedns"
     ' "${PRIVATE_DIR}/xray-json-auto.template.json" >/dev/null || \
-        die 'AUTO template lost its hidden Remark selector, leastPing or DoH-only contract.'
+        die 'AUTO template lost its selector, DNS, balancing, or RU-direct routing contract.'
 
     if [[ "${ENABLE_HYSTERIA}" == 1 && ${#xray_server_mounts[@]} -eq 0 ]]; then
         # Before the first public ACME issuance there is deliberately no local

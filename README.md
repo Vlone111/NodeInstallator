@@ -6,7 +6,7 @@
 
 Зафиксированная совместимая база:
 
-- NodeInstallator `2026-08-13.9`;
+- NodeInstallator `2026-08-14.1`;
 - Remnawave Panel/Backend `2.8.1`;
 - Remnawave Node `2.8.0`;
 - встроенный Xray `26.6.27`;
@@ -47,6 +47,12 @@ Panel -> allowlisted Node API port -> Remnawave Node -> managed Xray
 - Xray/Caddy/HAProxy backend-порты остаются на loopback;
 - Node API разрешается только реально наблюдаемому egress IP панели;
 - мастер генерирует XRAY_JSON AUTO template для Happ/INCY;
+- клиентский AUTO template перехватывает DNS в TUN, отправляет российские
+  сервисы, игровые порты и распознанный BitTorrent напрямую с устройства, а
+  остальной трафик — через health-aware `RU_AUTO`;
+- локальный cover-site — полноценный адаптивный endpoint dashboard без
+  сторонних CDN, analytics и cookies; его статический payload жёстко ограничен
+  40 MiB (фактический размер значительно меньше);
 - host tuning включает live `fq`, BBR, MTU probing и 32 MiB TCP autotuning;
   контейнеры используют относительные CPU weights без жёсткого CFS-потолка,
   поэтому свободные vCPU доступны для кратковременного throughput burst;
@@ -162,6 +168,27 @@ Plural-поля `lengths`/`delays` на старом ядре приводят �
 Обычный TLS/XHTTP на чужом имени мастер не предлагает: для него нужен
 сертификат, соответствующий домену; чужое имя здесь применимо именно как
 REALITY target/SNI.
+
+## Клиентский RU-direct routing
+
+Готовый XRAY_JSON template сохраняет DNS-перехват первым, после чего отправляет
+напрямую с клиентского устройства:
+
+- базово распознанный BitTorrent;
+- Steam/STUN-порты `27015-27059,3478,4379-4380`;
+- `geosite:category-ru`, Steam, Twitch, Apple, Xiaomi, Huawei и Android
+  downloads;
+- основные российские банки, государственные сервисы, маркетплейсы, доставку,
+  VK/Mail.ru, Yandex, 2GIS, Wildberries, Ozon, Avito, Самокат, Купер,
+  Мегамаркет, X5 и Золотое Яблоко;
+- `geoip:ru` и локальные `geoip:private` адреса.
+
+`geosite:category-ru` уже включает весь `.ru` и профильные категории банков,
+государственных, retail- и e-commerce-сервисов; явные домены в шаблоне нужны
+для важных `.com`, `.net`, `.tech` и региональных endpoints. Остальной трафик
+остаётся за `RU_AUTO`. DIRECT означает, что соответствующий сервис видит
+реальный IP пользователя. Распознавание зашифрованного или обфусцированного
+BitTorrent не гарантируется самим Xray.
 
 Короткие значения для автоматизации тоже поддерживаются:
 
