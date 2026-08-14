@@ -15,9 +15,9 @@ export LC_ALL=C
 # client-side ClientHello fragmentation to one selected REALITY path; FinalMask is never placed
 # on a REALITY server inbound because Xray 26.6.27 has a known crash regression
 # in that combination.  The script never edits Panel directly: SECRET_KEY and
-# Host UUIDs are Panel outputs and are requested only at explicit stage gates.
+# Host UUIDs are Panel outputs and are requested once before AUTO generation.
 
-SCRIPT_VERSION='2026-08-14.6'
+SCRIPT_VERSION='2026-08-14.7'
 EXPECTED_XRAY_VERSION='26.6.27'
 NODE_IMAGE='remnawave/node@sha256:03f14935751b4ab565181e2b1766ccd1a9ac349d6839acd3ee49014e543fa232'
 HAPROXY_IMAGE='haproxy@sha256:79799e8b2977e60802774fa53d29e6b54e045402cdd8a8b9fe43923e7095a047'
@@ -136,17 +136,17 @@ show_banner() {
     [[ "${UI_TTY}" == 1 && "${QUIET_UI}" != 1 ]] || return 0
     printf '\n%b' "${UI_CYAN}${UI_BOLD}"
     if ((UI_COLUMNS < 72)); then
-        printf '  REMNAWAVE EDGE WIZARD\n'
-        printf '  resilient 443 edge\n'
+        printf '  УСТАНОВЩИК REMNAWAVE EDGE\n'
+        printf '  четыре inbound · пять Host · один TCP/UDP 443\n'
     elif [[ "${UI_UNICODE}" == 1 ]]; then
         printf '  ╭──────────────────────────────────────────────────────────────────╮\n'
-        printf '  │  REMNAWAVE EDGE WIZARD                                           │\n'
-        printf '  │  resilient 443 edge · safe staged deployment                    │\n'
+        printf '  │  УСТАНОВЩИК REMNAWAVE EDGE                                      │\n'
+        printf '  │  четыре inbound · пять Host · один TCP/UDP 443                  │\n'
         printf '  ╰──────────────────────────────────────────────────────────────────╯\n'
     else
         printf '  +------------------------------------------------------------------+\n'
-        printf '  |  REMNAWAVE EDGE WIZARD                                           |\n'
-        printf '  |  resilient 443 edge - safe staged deployment                    |\n'
+        printf '  |  REMNAWAVE EDGE INSTALLER                                        |\n'
+        printf '  |  four inbounds - five Hosts - one TCP/UDP 443                   |\n'
         printf '  +------------------------------------------------------------------+\n'
     fi
     if ((UI_COLUMNS < 72)); then
@@ -210,21 +210,21 @@ ui_status_row() {
 
 announce_stage() {
     case "$1" in
-        bootstrap)     ui_section 'Bootstrap' 'base packages and pinned Docker runtime' ;;
-        init)          ui_section 'Initialize' 'collect settings, generate and validate protected artifacts' ;;
-        panel)         ui_section 'Panel - stage 1' 'exact Remnawave 2.8.1 fields' ;;
-        node)          ui_section 'Node' 'control plane, firewall and managed Xray runtime' ;;
-        template)      ui_section 'Panel - stage 2' 'physical Host UUIDs and XRAY_JSON AUTO template' ;;
-        edge)          ui_section 'Edge' 'HAProxy, Caddy, certificates and public 443' ;;
-        verify)        ui_section 'Verification' 'DNS, mTLS, listeners, TLS and routing' ;;
-        verify-auth)   ui_section 'Authenticated tests' 'every selected transport with an active canary credential' ;;
-        tune)          ui_section 'Network tuning' 'reversible measured server baseline' ;;
+        bootstrap)     ui_section 'Подготовка сервера' 'пакеты и закреплённые Docker-образы' ;;
+        init)          ui_section 'Генерация конфигурации' 'ключи, профиль, edge и защитный сайт' ;;
+        panel)         ui_section 'Remnawave Panel' 'точные поля для версии 2.8.1' ;;
+        node)          ui_section 'Запуск Node' 'mTLS, UFW, сертификаты и Xray' ;;
+        template)      ui_section 'AUTO-шаблон' 'пять точных UUID физических Host' ;;
+        edge)          ui_section 'Публичный edge' 'HAProxy, Caddy и TCP/UDP 443' ;;
+        verify)        ui_section 'Проверка' 'DNS, mTLS, TLS, сайт и маршруты' ;;
+        verify-auth)   ui_section 'Проверка подключений' 'каждый транспорт с активным пользователем' ;;
+        tune)          ui_section 'Сетевой тюнинг' 'BBR, fq, MTU probing и буферы' ;;
         untune)        ui_section 'Restore tuning' 'restore the recorded pre-wizard sysctl state' ;;
         status)        ui_section 'Status' 'read-only runtime overview' ;;
         rollback)      ui_section 'Rollback' 'stop wizard-managed containers and preserve recovery data' ;;
         rollback-host) ui_section 'Host rollback' 'restore wizard firewall and tuning changes' ;;
-        selftest)      ui_section 'Self-test' 'isolated render and validation; no service or firewall changes' ;;
-        all)           ui_section 'Guided setup' 'complete staged installation with Panel checkpoints' ;;
+        selftest)      ui_section 'Самопроверка' 'изолированная генерация без изменений сервисов и UFW' ;;
+        all)           ui_section 'Установка' 'одна последовательность для чистого сервера' ;;
     esac
 }
 
@@ -235,112 +235,25 @@ acquire_global_lock() {
 
 usage() {
     cat <<'USAGE'
-Remnawave Edge Wizard - Panel 2.8.1 / Node 2.8.0
+Установщик Remnawave Edge — Panel 2.8.1 / Node 2.8.0
 
-Usage:
-  sudo ./remnawave-edge-oneclick.sh <command>
+Чистая установка без меню:
+  sudo ./remnawave-edge-oneclick.sh
 
-Guided setup:
-  all          Complete interactive setup with safe Panel checkpoints.
-  bootstrap    Install Ubuntu/Debian packages and Docker Compose.
-  init         Collect settings; generate and validate protected artifacts.
-  panel        Show exact Config Profile / Node fields for Panel 2.8.1.
-  node         Save Panel SECRET_KEY, apply narrow firewall rules, start Node.
-  template     Collect Host UUIDs and render the XRAY_JSON AUTO template.
-  edge         Start HAProxy + Caddy, obtain certificates and verify public 443.
+Установщик всегда создаёт четыре inbound и инструкции ровно для пяти Host:
+  REALITY self-SNI, REALITY external, REALITY external + FinalMask,
+  XHTTP/TLS и Hysteria2. AUTO-шаблон выбирает их только по пяти UUID.
 
-Verification and operation:
-  verify       DNS, mTLS, listener, TLS, cover-site and route checks.
-  verify-auth  End-to-end test every selected transport with a canary user.
-  status       Read-only runtime overview.
-  selftest     Isolated render/validation; never changes services or firewall.
-  tune         Apply the generated reversible network baseline.
-  untune       Restore the exact sysctl values recorded before tuning.
+Сервисные команды:
+  verify       полная проверка;
+  verify-auth  проверка всех транспортов с активным пользователем;
+  status       состояние без изменений;
+  selftest     изолированный тест генератора;
+  rollback     остановить контейнеры установщика;
+  rollback-host восстановить UFW и сетевой тюнинг (с подтверждением).
 
-Recovery:
-  rollback       Stop only wizard containers; preserve files/firewall/DNS.
-  rollback-host  Also restore wizard UFW and tuning changes; explicit confirmation.
-
-Optional environment variables:
-  RW_INSTALL_DIR, RW_NODE_NAME, RW_REALITY_SNI, RW_XHTTP_SNI, RW_EDGE_IPV4,
-  RW_PANEL_IPV4, RW_ACME_EMAIL, RW_NODE_PORT, RW_NODE_SECRET_KEY,
-  RW_ENABLE_SELF_REALITY=0|1, RW_ENABLE_EXTERNAL_REALITY=0|1,
-  RW_ENABLE_XHTTP=0|1, RW_ENABLE_HYSTERIA=0|1,
-  RW_EXTERNAL_REALITY_TARGET=host:443, RW_EXTERNAL_REALITY_SNI=host,
-  RW_ENABLE_RAW_FRAGMENT=0|1, RW_FRAGMENT_REALITY=self|external,
-  RW_CLIENT_FINGERPRINT (default: firefox),
-  RW_BLOCK_CLIENT_QUIC=0|1, RW_APPLY_TUNING=0|1,
-  RW_SKIP_DNS=1, RW_SKIP_UFW=1, RW_SSH_PORT,
-  RW_CONFIRM_HOST_ROLLBACK=RESTORE,
-  RW_NON_INTERACTIVE=1, RW_SHOW_VALUES=1,
-  RW_NO_COLOR=1 (or NO_COLOR=1), RW_ASCII=1, RW_QUIET=1
-
-Secrets and ready JSON are stored under INSTALL_DIR/private with mode 0600.
-The `panel`/`all` stages print only field-by-field instructions and protected
-file paths; they never print SECRET_KEY or the generated private keys.
+Секреты и готовые JSON хранятся в /opt/remnawave-edge/private с mode 0600.
 USAGE
-}
-
-choose_command() {
-    local choice=''
-    ui_section 'Choose an action' 'nothing runs until you select a command'
-    if ((UI_COLUMNS >= 72)); then
-        cat <<'MENU'
-   1) Guided full setup          9) Full verification
-   2) Bootstrap packages       10) Authenticated transport tests
-   3) Safe isolated self-test  11) Read-only status
-   4) Initialize files         12) Apply network tuning
-   5) Show Panel stage 1       13) Restore network tuning
-   6) Start / verify Node      14) Stop wizard containers
-   7) Build AUTO template      15) Restore host changes
-   8) Start / verify edge
-
-   h) Help                      0) Exit
-MENU
-    else
-        cat <<'MENU'
-   1) Guided full setup
-   2) Bootstrap packages
-   3) Safe isolated self-test
-   4) Initialize files
-   5) Show Panel stage 1
-   6) Start / verify Node
-   7) Build AUTO template
-   8) Start / verify edge
-   9) Full verification
-  10) Authenticated transport tests
-  11) Read-only status
-  12) Apply network tuning
-  13) Restore network tuning
-  14) Stop wizard containers
-  15) Restore host changes
-
-   h) Help
-   0) Exit
-MENU
-    fi
-    printf '\n%b?%b Select: ' "${UI_CYAN}${UI_BOLD}" "${UI_RESET}"
-    IFS= read -r choice || exit 0
-    case "${choice}" in
-        1) SELECTED_COMMAND='all' ;;
-        2) SELECTED_COMMAND='bootstrap' ;;
-        3) SELECTED_COMMAND='selftest' ;;
-        4) SELECTED_COMMAND='init' ;;
-        5) SELECTED_COMMAND='panel' ;;
-        6) SELECTED_COMMAND='node' ;;
-        7) SELECTED_COMMAND='template' ;;
-        8) SELECTED_COMMAND='edge' ;;
-        9) SELECTED_COMMAND='verify' ;;
-        10) SELECTED_COMMAND='verify-auth' ;;
-        11) SELECTED_COMMAND='status' ;;
-        12) SELECTED_COMMAND='tune' ;;
-        13) SELECTED_COMMAND='untune' ;;
-        14) SELECTED_COMMAND='rollback' ;;
-        15) SELECTED_COMMAND='rollback-host' ;;
-        h|H|'?') SELECTED_COMMAND='help' ;;
-        0|'') exit 0 ;;
-        *) die "Unknown menu choice: ${choice}" ;;
-    esac
 }
 
 set_paths() {
@@ -365,7 +278,7 @@ persist_installer() {
         warn "Could not persist the running installer at ${target_path}; keep the launch command for resume."
         return 0
     fi
-    log "Reusable installer saved at ${target_path}."
+    log "Повторно запускаемая копия сохранена: ${target_path}."
 }
 
 require_root() {
@@ -492,7 +405,7 @@ PY
     grep -Eq 'TLS Post-Quantum key exchange:[[:space:]]+true' <<<"${xray_output}" && \
         EXTERNAL_TARGET_LAST_PQ=1
     if [[ "${quiet}" != 1 ]]; then
-        success "External REALITY target ${target} passed TLS 1.3, hostname and Xray probes (${EXTERNAL_TARGET_LAST_IPS})."
+        success "REALITY target ${target} прошёл TLS 1.3, hostname и Xray-проверки (${EXTERNAL_TARGET_LAST_IPS})."
         [[ "${EXTERNAL_TARGET_LAST_PQ}" == 1 ]] || \
             warn "${target} did not negotiate post-quantum TLS in the current Xray probe."
     fi
@@ -509,10 +422,10 @@ select_external_reality_target() {
             die "External REALITY target ${EXTERNAL_REALITY_TARGET} failed DNS/TLS/Xray validation."
         return 0
     fi
-    log 'Benchmarking external REALITY targets from this Node...'
+    log 'Измеряю внешние REALITY target с этой Node.'
     for candidate in "${candidates[@]}"; do
         if probe_external_reality_target "${candidate}" "${candidate%:*}" 1; then
-            log "Candidate ${candidate}: TLS=${EXTERNAL_TARGET_LAST_SCORE}s, IP=${EXTERNAL_TARGET_LAST_IPS}, PQ=${EXTERNAL_TARGET_LAST_PQ}."
+            log "Кандидат ${candidate}: TLS=${EXTERNAL_TARGET_LAST_SCORE}s, IP=${EXTERNAL_TARGET_LAST_IPS}, PQ=${EXTERNAL_TARGET_LAST_PQ}."
             if awk -v current="${EXTERNAL_TARGET_LAST_SCORE}" -v best="${best_score}" \
                 'BEGIN {exit !(current < best)}'; then
                 best_target="${candidate}"
@@ -526,7 +439,7 @@ select_external_reality_target() {
     [[ -n "${best_target}" ]] || die 'No external REALITY preset passed validation; rerun with a verified custom target.'
     EXTERNAL_REALITY_TARGET="${best_target}"
     EXTERNAL_REALITY_SNI="${best_sni}"
-    success "Selected ${EXTERNAL_REALITY_TARGET} as the fastest currently valid regional target (TLS ${best_score}s)."
+    success "Выбран самый быстрый валидный target ${EXTERNAL_REALITY_TARGET} (TLS ${best_score}s)."
 }
 
 caddy_volume_name() {
@@ -662,8 +575,8 @@ wait_for_enter() {
     local text="$1"
     if [[ "${NON_INTERACTIVE}" == 1 || ! -t 0 ]]; then return; fi
     printf '\n%b%s%b\n' "${UI_YELLOW}${UI_BOLD}" "${text}" "${UI_RESET}"
-    printf '%bPress Enter to continue...%b ' "${UI_DIM}" "${UI_RESET}"
-    IFS= read -r _ || die 'Input was interrupted.'
+    printf '%bНажмите Enter, чтобы продолжить...%b ' "${UI_DIM}" "${UI_RESET}"
+    IFS= read -r _ || die 'Ввод был прерван.'
 }
 
 write_state() {
@@ -709,6 +622,14 @@ write_state() {
             printf 'EXTERNAL_REALITY_SHORT_ID=%q\n' "${EXTERNAL_REALITY_SHORT_ID}"
         }
         printf 'XHTTP_PATH=%q\n' "${XHTTP_PATH}"
+        [[ -z "${RAW_HOST_UUID:-}" ]] || printf 'RAW_HOST_UUID=%q\n' "${RAW_HOST_UUID}"
+        [[ -z "${EXTERNAL_REALITY_HOST_UUID:-}" ]] || \
+            printf 'EXTERNAL_REALITY_HOST_UUID=%q\n' "${EXTERNAL_REALITY_HOST_UUID}"
+        [[ -z "${RAW_FRAGMENT_HOST_UUID:-}" ]] || \
+            printf 'RAW_FRAGMENT_HOST_UUID=%q\n' "${RAW_FRAGMENT_HOST_UUID}"
+        [[ -z "${XHTTP_HOST_UUID:-}" ]] || printf 'XHTTP_HOST_UUID=%q\n' "${XHTTP_HOST_UUID}"
+        [[ -z "${HYSTERIA_HOST_UUID:-}" ]] || \
+            printf 'HYSTERIA_HOST_UUID=%q\n' "${HYSTERIA_HOST_UUID}"
     } >"${state_tmp}"; then
         truncate -s 0 "${state_tmp}" 2>/dev/null || true
         find "${state_tmp}" -maxdepth 0 -delete 2>/dev/null || true
@@ -754,6 +675,11 @@ load_state() {
     XHTTP_TAG="${XHTTP_TAG:-RW_${NODE_CODE}_XHTTP_TLS}"
     EXTERNAL_REALITY_TAG="${EXTERNAL_REALITY_TAG:-RW_${NODE_CODE}_RAW_REALITY_EXTERNAL}"
     HYSTERIA_TAG="${HYSTERIA_TAG:-RW_${NODE_CODE}_HYSTERIA2}"
+    RAW_HOST_UUID="${RAW_HOST_UUID:-}"
+    EXTERNAL_REALITY_HOST_UUID="${EXTERNAL_REALITY_HOST_UUID:-}"
+    RAW_FRAGMENT_HOST_UUID="${RAW_FRAGMENT_HOST_UUID:-}"
+    XHTTP_HOST_UUID="${XHTTP_HOST_UUID:-}"
+    HYSTERIA_HOST_UUID="${HYSTERIA_HOST_UUID:-}"
 
     missing=()
     if [[ "${ENABLE_SELF_REALITY}" == 1 ]]; then
@@ -791,7 +717,7 @@ pull_images() {
     local image xray_version
     for image in "${NODE_IMAGE}" "${HAPROXY_IMAGE}" "${CADDY_IMAGE}"; do
         if ! docker image inspect "${image}" >/dev/null 2>&1; then
-            log "Pulling pinned image ${image%%@*}..."
+            log "Загружаю закреплённый образ ${image%%@*}."
             docker pull "${image}" >/dev/null
         fi
     done
@@ -1473,23 +1399,20 @@ render_happ_rules() {
     # first-match Response Rule here would be a needless, high-blast-radius
     # change and could override an administrator's existing rules.
     cat >"${PRIVATE_DIR}/SUBSCRIPTION-SETTINGS.txt" <<'EOF'
-Remnawave 2.8.1 subscription settings
+Настройки подписки Remnawave 2.8.1
 
-1. Enable: Serve JSON at base subscription.
-2. Keep the existing system Response Rules in their current order.
-3. Do not add a new Happ/INCY rule for this deployment.
-4. Keep happRouting empty; routing and DNS are in the XRAY_JSON template.
-5. Test with the normal base subscription URL, not a forced /json suffix.
-6. The template sends Russian services, selected game ports and detected
-   BitTorrent DIRECT from the client. Those destinations see the client's real
-   public IP. Remove the DIRECT rules if a squad requires strict full-tunnel
-   privacy instead of local-RU reachability and latency.
+1. Включите Serve JSON at base subscription.
+2. Не меняйте порядок существующих системных Response Rules.
+3. Не добавляйте отдельное правило Happ/INCY.
+4. Оставьте happRouting пустым: DNS и маршруты находятся в XRAY_JSON template.
+5. Используйте обычную базовую ссылку подписки без принудительного /json.
+6. Российские сервисы, выбранные игровые порты и распознанный BitTorrent идут
+   DIRECT с устройства. Эти назначения увидят реальный IP пользователя.
 EOF
     chmod 0600 "${PRIVATE_DIR}/SUBSCRIPTION-SETTINGS.txt"
 }
 
 render_auto_template() {
-    local remark_pattern="^RW ${NODE_CODE} (REALITY|XHTTP|HY2)( |$)"
     local output="${PRIVATE_DIR}/xray-json-auto.template.json"
     cat >"${output}" <<EOF
 {
@@ -1497,8 +1420,14 @@ render_auto_template() {
     "injectHosts": [
       {
         "selector": {
-          "type": "remarkRegex",
-          "pattern": "${remark_pattern}"
+          "type": "uuids",
+          "values": [
+            "__RAW_HOST_UUID__",
+            "__EXTERNAL_REALITY_HOST_UUID__",
+            "__RAW_FRAGMENT_HOST_UUID__",
+            "__XHTTP_HOST_UUID__",
+            "__HYSTERIA_HOST_UUID__"
+          ]
         },
         "selectFrom": "HIDDEN",
         "tagPrefix": "proxy"
@@ -1666,7 +1595,22 @@ EOF
         mv -f "${output}.tmp" "${output}"
     fi
     chmod 0600 "${output}"
-    install -m 0600 "${output}" "${PRIVATE_DIR}/xray-json-auto.ready.json"
+    find "${PRIVATE_DIR}/xray-json-auto.ready.json" -maxdepth 0 -delete 2>/dev/null || true
+    if validate_uuid "${RAW_HOST_UUID:-}" && \
+       validate_uuid "${EXTERNAL_REALITY_HOST_UUID:-}" && \
+       validate_uuid "${RAW_FRAGMENT_HOST_UUID:-}" && \
+       validate_uuid "${XHTTP_HOST_UUID:-}" && \
+       validate_uuid "${HYSTERIA_HOST_UUID:-}"; then
+        jq --arg raw "${RAW_HOST_UUID,,}" \
+           --arg external "${EXTERNAL_REALITY_HOST_UUID,,}" \
+           --arg fragment "${RAW_FRAGMENT_HOST_UUID,,}" \
+           --arg xhttp "${XHTTP_HOST_UUID,,}" \
+           --arg hysteria "${HYSTERIA_HOST_UUID,,}" '
+          .remnawave.injectHosts[0].selector.values =
+            [$raw, $external, $fragment, $xhttp, $hysteria]
+        ' "${output}" >"${PRIVATE_DIR}/xray-json-auto.ready.json"
+        chmod 0600 "${PRIVATE_DIR}/xray-json-auto.ready.json"
+    fi
 }
 
 selected_primary_inbound_tag() {
@@ -1809,7 +1753,7 @@ PHYSICAL HOST — REALITY ${base_name} / CLIENT FRAGMENT A/B
 
    FinalMask is client-side only. Never paste it into the server profile."
     fi
-    cat >"${PRIVATE_DIR}/PANEL-STAGE-1.txt" <<EOF
+    cat >"${PRIVATE_DIR}/PANEL-HOSTS.txt" <<EOF
 REMNAWAVE PANEL 2.8.1 — STAGE 1
 ================================
 ${migration_note}
@@ -1864,7 +1808,7 @@ Do not type a public key, shortId, flow or public id into a Host. Remnawave
 
 The later AUTO carrier Host must bind to: ${primary_tag}
 EOF
-    chmod 0600 "${PRIVATE_DIR}/PANEL-STAGE-1.txt"
+    chmod 0600 "${PRIVATE_DIR}/PANEL-HOSTS.txt"
 }
 
 render_panel_stage_two() {
@@ -1872,13 +1816,13 @@ render_panel_stage_two() {
     primary_tag="$(selected_primary_inbound_tag)"
     ((physical_count += ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA))
     [[ "${ENABLE_RAW_FRAGMENT}" != 1 ]] || ((physical_count += 1))
-    cat >"${PRIVATE_DIR}/PANEL-STAGE-2.txt" <<EOF
+    cat >"${PRIVATE_DIR}/PANEL-AUTO.txt" <<EOF
 REMNAWAVE PANEL 2.8.1 — STAGE 2
 ================================
 
 The AUTO template selects hidden physical Hosts whose Remark starts with
 "RW ${NODE_CODE} REALITY", "RW ${NODE_CODE} XHTTP" or "RW ${NODE_CODE} HY2".
-No Host UUID input is required.
+This legacy text is not used by the linear installer.
 
 1. XRAY_JSON TEMPLATE
    Create template: RW-${NODE_CODE}-AUTO
@@ -1911,7 +1855,113 @@ No Host UUID input is required.
    Run edge, verify and verify-auth. Test every selected transport separately,
    then AUTO in Happ/INCY TUN before expanding beyond the canary squad.
 EOF
-    chmod 0600 "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
+    chmod 0600 "${PRIVATE_DIR}/PANEL-AUTO.txt"
+}
+
+render_panel_guides_ru() {
+    cat >"${PRIVATE_DIR}/PANEL-HOSTS.txt" <<EOF
+REMNAWAVE 2.8.1 — ЧТО СОЗДАТЬ В ПАНЕЛИ
+=========================================
+
+1. CONFIG PROFILE
+   Имя: ${PROFILE_NAME}
+   Вставьте целиком файл: ${PRIVATE_DIR}/config-profile.ready.json
+   В профиле уже находятся ровно четыре managed inbound:
+   • ${RAW_TAG}
+   • ${EXTERNAL_REALITY_TAG}
+   • ${XHTTP_TAG}
+   • ${HYSTERIA_TAG}
+   Ничего не добавляйте в clients, flow, public id или FinalMask профиля.
+
+2. NODE
+   Имя: RW-${NODE_CODE}
+   Address: ${EDGE_IPV4}
+   Port: ${NODE_PORT}
+   Config Profile: ${PROFILE_NAME}
+   Active Inbounds: выберите все четыре inbound выше
+   Plugin: выключен; Traffic multiplier: 1.0 / 1.0
+   Сохраните Node и скопируйте выданный SECRET_KEY.
+
+3. ДОСТУП
+   Создайте Internal Squad RW-${NODE_CODE}-CANARY, включите в него все четыре
+   inbound и добавьте одного ACTIVE-пользователя без HWID для проверки.
+
+4. СОЗДАЙТЕ РОВНО ПЯТЬ ФИЗИЧЕСКИХ HOST
+   У всех пяти: Host Visibility ON, Hide Host ON, Nodes — необязательное
+   визуальное поле. Теги — только административные. После сохранения каждого
+   Host скопируйте UUID из заголовка окна редактирования.
+
+   HOST 1 — REALITY SELF-SNI
+   Remark: RW ${NODE_CODE} REALITY SELF FIREFOX
+   Inbound: ${RAW_TAG}
+   Address: ${EDGE_IPV4}; Port: 443
+   Fingerprint: ${CLIENT_FINGERPRINT}
+   SNI/Host/Path/ALPN/Security/Mux/SockOpt/FinalMask: пусто или default
+   Exclude formats: XRAY_JSON
+
+   HOST 2 — REALITY EXTERNAL
+   Remark: RW ${NODE_CODE} REALITY EXTERNAL FIREFOX
+   Inbound: ${EXTERNAL_REALITY_TAG}
+   Address: ${EDGE_IPV4}; Port: 443
+   SNI: ${EXTERNAL_REALITY_SNI}; Fingerprint: ${CLIENT_FINGERPRINT}
+   Host/Path/ALPN/Security/Mux/SockOpt/FinalMask: пусто или default
+   Exclude formats: XRAY_JSON
+
+   HOST 3 — REALITY EXTERNAL + FINALMASK
+   Remark: RW ${NODE_CODE} REALITY EXTERNAL FRAGMENT
+   Inbound: ${EXTERNAL_REALITY_TAG}
+   Address: ${EDGE_IPV4}; Port: 443
+   SNI: ${EXTERNAL_REALITY_SNI}; Fingerprint: ${CLIENT_FINGERPRINT}
+   FinalMask: вставьте целиком ${INSTALL_DIR}/finalmask-fragment-canary.json
+   Остальные overrides: пусто или default
+   Exclude formats: XRAY_JSON
+
+   HOST 4 — XHTTP/TLS
+   Remark: RW ${NODE_CODE} XHTTP FIREFOX
+   Inbound: ${XHTTP_TAG}
+   Address: ${EDGE_IPV4}; Port: 443
+   SNI: ${XHTTP_SNI}; Host: ${XHTTP_SNI}
+   Security Layer: TLS; ALPN: h2; Fingerprint: ${CLIENT_FINGERPRINT}
+   Path: пусто — он наследуется из inbound вместе с завершающим /.
+   XHTTP Extra/Mux/SockOpt/FinalMask: пусто
+   Exclude formats: XRAY_JSON
+
+   HOST 5 — HYSTERIA2
+   Remark: RW ${NODE_CODE} HYSTERIA2
+   Inbound: ${HYSTERIA_TAG}
+   Address: ${EDGE_IPV4}; Port: 443
+   Security Layer: TLS; ALPN: h3; Fingerprint: ${CLIENT_FINGERPRINT}
+   SNI: пусто — наследуется ${XHTTP_SNI}; allowInsecure и pin: выключены
+   Host/Path/Mux/SockOpt/FinalMask: пусто
+   Exclude formats: XRAY_JSON
+
+После этого вернитесь в установщик. Он скрыто запросит SECRET_KEY и пять UUID.
+EOF
+
+    cat >"${PRIVATE_DIR}/PANEL-AUTO.txt" <<EOF
+REMNAWAVE 2.8.1 — ФИНАЛЬНОЕ ПОДКЛЮЧЕНИЕ AUTO
+=============================================
+
+1. Создайте Xray JSON Template с именем RW-${NODE_CODE}-AUTO и вставьте:
+   ${PRIVATE_DIR}/xray-json-auto.ready.json
+
+2. Создайте один виртуальный Host-контейнер:
+   Remark: RW ${NODE_CODE} AUTO
+   Inbound: ${RAW_TAG} (обязательная привязка интерфейса Panel)
+   Address: ${EDGE_IPV4}; Port: 443
+   Xray JSON Template: RW-${NODE_CODE}-AUTO
+   Host Visibility ON; Hide Host OFF; overrides пустые
+   Exclude: Xray Base64, Mihomo, Stash, Singbox и Clash
+   Не исключать: Xray JSON
+
+3. В Subscription Settings включите Serve JSON at base subscription.
+   Существующие Response Rules и happRouting не меняйте. В Happ/INCY достаточно
+   обновить обычную ссылку подписки.
+
+AUTO содержит ровно пять UUID, а не regex по Remark. Виртуальный Host не
+добавляется шестым outbound: шаблон не использует addVirtualHostAsOutbound.
+EOF
+    chmod 0600 "${PRIVATE_DIR}/PANEL-HOSTS.txt" "${PRIVATE_DIR}/PANEL-AUTO.txt"
 }
 
 render_all_files() {
@@ -1927,8 +1977,7 @@ render_all_files() {
     render_tuning
     render_happ_rules
     render_auto_template
-    render_panel_stage_one
-    render_panel_stage_two
+    render_panel_guides_ru
 }
 
 snapshot_generated_artifacts() {
@@ -1938,7 +1987,7 @@ snapshot_generated_artifacts() {
       finalmask-fragment-canary.json 99-remnawave-edge.conf site
       private/config-profile.ready.json private/edge.env
       private/xray-json-auto.template.json private/xray-json-auto.ready.json
-      private/SUBSCRIPTION-SETTINGS.txt private/PANEL-STAGE-1.txt private/PANEL-STAGE-2.txt
+      private/SUBSCRIPTION-SETTINGS.txt private/PANEL-HOSTS.txt private/PANEL-AUTO.txt
     )
     : >"${snapshot_dir}/manifest"
     for rel in "${artifacts[@]}"; do
@@ -2103,7 +2152,7 @@ validate_artifacts() {
     local caddy_output caddy_json node_compose_json edge_compose_json xray_validation_config=''
     local expected_inbounds=0 expected_hosts=0 site_bytes required_site_file
     local -a caddy_subjects=("${REALITY_SNI}") xray_server_mounts=() material=()
-    log 'Validating strict JSON, pinned Xray, Compose, HAProxy and Caddy...'
+    log 'Проверяю JSON, закреплённый Xray, Compose, HAProxy и Caddy.'
     jq empty "${PRIVATE_DIR}/config-profile.ready.json"
     jq empty "${PRIVATE_DIR}/xray-json-auto.template.json"
     jq empty "${INSTALL_DIR}/finalmask-fragment-canary.json"
@@ -2214,14 +2263,21 @@ validate_artifacts() {
         fi
     fi
 
-    [[ "$(grep -Fc 'Exclude formats: XRAY_JSON' "${PRIVATE_DIR}/PANEL-STAGE-1.txt")" \
+    [[ "$(grep -Fc 'Exclude formats: XRAY_JSON' "${PRIVATE_DIR}/PANEL-HOSTS.txt")" \
         == "${expected_hosts}" ]] || \
         die 'Panel guide does not exclude every physical Host from standalone XRAY_JSON output.'
 
     jq -e '
       .remnawave.injectHosts[0].selectFrom == "HIDDEN" and
-      .remnawave.injectHosts[0].selector.type == "remarkRegex" and
-      (.remnawave.injectHosts[0].selector.pattern | startswith("^RW ")) and
+      .remnawave.injectHosts[0].selector.type == "uuids" and
+      (.remnawave.injectHosts[0].selector | has("pattern") | not) and
+      (.remnawave.injectHosts[0].selector.values == [
+        "__RAW_HOST_UUID__",
+        "__EXTERNAL_REALITY_HOST_UUID__",
+        "__RAW_FRAGMENT_HOST_UUID__",
+        "__XHTTP_HOST_UUID__",
+        "__HYSTERIA_HOST_UUID__"
+      ]) and
       .routing.balancers[0].strategy.type == "leastPing" and
       ([.routing.rules[] | select(
         .outboundTag == "direct" and .protocol == ["bittorrent"]
@@ -2249,6 +2305,24 @@ validate_artifacts() {
       .dns.servers[2].address == "fakedns"
     ' "${PRIVATE_DIR}/xray-json-auto.template.json" >/dev/null || \
         die 'AUTO template lost its selector, DNS, balancing, or RU-direct routing contract.'
+
+    if [[ -f "${PRIVATE_DIR}/xray-json-auto.ready.json" ]]; then
+        jq -e --arg raw "${RAW_HOST_UUID,,}" \
+          --arg external "${EXTERNAL_REALITY_HOST_UUID,,}" \
+          --arg fragment "${RAW_FRAGMENT_HOST_UUID,,}" \
+          --arg xhttp "${XHTTP_HOST_UUID,,}" \
+          --arg hysteria "${HYSTERIA_HOST_UUID,,}" '
+          .remnawave.injectHosts[0].selector.type == "uuids" and
+          (.remnawave.injectHosts[0].selector | has("pattern") | not) and
+          (.remnawave.injectHosts[0].selector.values ==
+            [$raw, $external, $fragment, $xhttp, $hysteria]) and
+          ((.remnawave.injectHosts[0].selector.values | unique | length) == 5) and
+          (all(.remnawave.injectHosts[0].selector.values[];
+            test("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))) and
+          ([.. | strings | select(startswith("__") and endswith("__"))] | length == 0)
+        ' "${PRIVATE_DIR}/xray-json-auto.ready.json" >/dev/null || \
+            die 'Готовый AUTO-шаблон должен содержать ровно пять уникальных Host UUID.'
+    fi
 
     if [[ "${ENABLE_HYSTERIA}" == 1 && ${#xray_server_mounts[@]} -eq 0 ]]; then
         # Before the first public ACME issuance there is deliberately no local
@@ -2350,7 +2424,7 @@ validate_artifacts() {
       ([.apps.http.servers[].listen[]] | index("0.0.0.0:19443") == null)
     ' <<<"${caddy_json}" >/dev/null || \
         die 'Caddy lost its selected-subject TLS-ALPN or loopback-only listener contract.'
-    log 'Artifact validation passed.'
+    log 'Все сгенерированные файлы прошли проверку.'
 }
 
 doh_record_values() {
@@ -2394,10 +2468,10 @@ check_dns() {
         warn 'DNS checks skipped by RW_SKIP_DNS=1.'
         return 0
     fi
-    log 'Checking public DNS through Cloudflare and Google DoH...'
+    log 'Проверяю публичный DNS через Cloudflare и Google DoH.'
     check_one_domain_dns "${REALITY_SNI}"
     if [[ "${ENABLE_XHTTP}" == 1 ]]; then check_one_domain_dns "${XHTTP_SNI}"; fi
-    log 'DNS checks passed.'
+    log 'Публичный DNS настроен правильно.'
 }
 
 port_is_listening() {
@@ -2609,7 +2683,7 @@ apply_firewall() {
             ufw allow 443/udp comment "Remnawave Hysteria2 ${NODE_CODE}" >/dev/null
         ufw --force enable >/dev/null
         status="$(ufw status verbose)"
-        log "UFW enabled after allowing SSH TCP/${ssh_port}, Panel control and public TCP/443."
+        log "UFW включён: SSH TCP/${ssh_port}, управление Panel и публичный TCP/443 разрешены."
     fi
     grep -Eq 'Default: deny \(incoming\)' <<<"${status}" || \
         die 'UFW incoming default is not deny.'
@@ -2663,7 +2737,7 @@ apply_firewall() {
     if [[ "${ENABLE_HYSTERIA}" == 1 ]]; then
         ufw status | awk '$1 == "443/udp" && $2 == "ALLOW" {found=1} END {exit !found}' || \
             die 'UFW did not expose the selected Hysteria2 UDP/443 transport.'
-        log "UFW permits public TCP+UDP/443 and Node API ${NODE_PORT}/tcp only from ${PANEL_IPV4}."
+        log "UFW: TCP+UDP/443 публичны, API Node ${NODE_PORT}/tcp доступен только ${PANEL_IPV4}."
     else
         log "UFW permits public TCP/443 and Node API ${NODE_PORT}/tcp only from ${PANEL_IPV4}."
     fi
@@ -2763,43 +2837,17 @@ show_configuration_summary() {
 
 init_stage() {
     local detected_ip default_node_name
-    local fragment_override_set=0 fragment_override='' fragment_base_override=''
     announce_stage init
     require_root
     set_paths
     need_commands
     persist_installer
-    if [[ ${RW_ENABLE_RAW_FRAGMENT+x} ]]; then
-        fragment_override_set=1
-        fragment_override="${RW_ENABLE_RAW_FRAGMENT}"
-        fragment_base_override="${RW_FRAGMENT_REALITY:-external}"
-    fi
     if [[ -f "${STATE_FILE}" ]]; then
         load_state
-        if [[ "${fragment_override_set}" == 1 ]]; then
-            [[ "${fragment_override}" =~ ^[01]$ ]] || \
-                die 'RW_ENABLE_RAW_FRAGMENT must be 0 or 1.'
-            if [[ "${fragment_override}" == 1 ]]; then
-                [[ "${ENABLE_SELF_REALITY}" == 1 || "${ENABLE_EXTERNAL_REALITY}" == 1 ]] || \
-                    die 'FinalMask/fragment Host requires at least one selected REALITY inbound.'
-                case "${fragment_base_override}" in
-                    external)
-                        [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]] || \
-                            die 'RW_FRAGMENT_REALITY=external requires the external REALITY inbound.'
-                        ;;
-                    self)
-                        [[ "${ENABLE_SELF_REALITY}" == 1 ]] || \
-                            die 'RW_FRAGMENT_REALITY=self requires the self-SNI REALITY inbound.'
-                        ;;
-                    *) die 'RW_FRAGMENT_REALITY must be self or external.' ;;
-                esac
-                FRAGMENT_REALITY="${fragment_base_override}"
-            else
-                FRAGMENT_REALITY='self'
-            fi
-            ENABLE_RAW_FRAGMENT="${fragment_override}"
-        fi
         validate_loaded_state
+        [[ "${ENABLE_SELF_REALITY}:${ENABLE_EXTERNAL_REALITY}:${ENABLE_XHTTP}:${ENABLE_HYSTERIA}:${ENABLE_RAW_FRAGMENT}:${FRAGMENT_REALITY}:${CLIENT_FINGERPRINT}" == \
+           '1:1:1:1:1:external:firefox' ]] || \
+            die 'Сохранённое состояние создано старым выборочным мастером. Для нового фиксированного набора используйте чистый сервер.'
         pull_images
         if [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
             probe_external_reality_target "${EXTERNAL_REALITY_TARGET}" "${EXTERNAL_REALITY_SNI}" || \
@@ -2821,55 +2869,28 @@ init_stage() {
     ACME_EMAIL="${RW_ACME_EMAIL:-thisaintu@proton.me}"
     NODE_PORT="${RW_NODE_PORT:-}"
     NODE_SLUG="${RW_NODE_NAME:-}"
-    ENABLE_SELF_REALITY="${RW_ENABLE_SELF_REALITY:-}"
-    ENABLE_EXTERNAL_REALITY="${RW_ENABLE_EXTERNAL_REALITY:-}"
-    ENABLE_XHTTP="${RW_ENABLE_XHTTP:-}"
-    ENABLE_HYSTERIA="${RW_ENABLE_HYSTERIA:-}"
-    ENABLE_RAW_FRAGMENT="${RW_ENABLE_RAW_FRAGMENT:-}"
-    FRAGMENT_REALITY="${RW_FRAGMENT_REALITY:-self}"
-    BLOCK_CLIENT_QUIC="${RW_BLOCK_CLIENT_QUIC:-1}"
-    APPLY_TUNING="${RW_APPLY_TUNING:-1}"
-    CLIENT_FINGERPRINT="${RW_CLIENT_FINGERPRINT:-firefox}"
-    ui_section 'Transport selection' 'each enabled transport gets its own inbound and physical Host'
-    prompt_yes_no ENABLE_SELF_REALITY 'Enable RAW/TCP + REALITY self-SNI?' 1
-    prompt_yes_no ENABLE_EXTERNAL_REALITY 'Enable RAW/TCP + REALITY on a measured external domain?' 1
-    prompt_yes_no ENABLE_XHTTP 'Enable VLESS XHTTP auto behind ordinary TLS/HTTP2?' 1
-    prompt_yes_no ENABLE_HYSTERIA 'Enable Hysteria2 on UDP/443?' 1
-    [[ "${ENABLE_SELF_REALITY}" =~ ^[01]$ && "${ENABLE_EXTERNAL_REALITY}" =~ ^[01]$ && \
-       "${ENABLE_XHTTP}" =~ ^[01]$ && "${ENABLE_HYSTERIA}" =~ ^[01]$ ]] || \
-        die 'Transport selections must be 0 or 1.'
-    ((ENABLE_SELF_REALITY + ENABLE_EXTERNAL_REALITY + ENABLE_XHTTP + ENABLE_HYSTERIA > 0)) || \
-        die 'Select at least one transport.'
-    if [[ "${ENABLE_SELF_REALITY}" != 1 && "${ENABLE_EXTERNAL_REALITY}" != 1 ]]; then
-        ENABLE_RAW_FRAGMENT=0
-    else
-        prompt_yes_no ENABLE_RAW_FRAGMENT \
-            'Create a separate REALITY FinalMask/ClientHello-fragment A/B Host?' 0
-    fi
-    if [[ "${ENABLE_RAW_FRAGMENT}" == 1 ]]; then
-        if [[ "${ENABLE_SELF_REALITY}" == 1 && "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
-            prompt_value FRAGMENT_REALITY 'Fragment Host base (self/external)' 'external'
-        elif [[ "${ENABLE_EXTERNAL_REALITY}" == 1 ]]; then
-            FRAGMENT_REALITY='external'
-        else
-            FRAGMENT_REALITY='self'
-        fi
-    else
-        FRAGMENT_REALITY='self'
-    fi
-    prompt_value REALITY_SNI 'Owned cover/self-SNI domain'
-    if [[ "${ENABLE_XHTTP}" == 1 ]]; then
-        prompt_value XHTTP_SNI 'Second owned domain for TLS/XHTTP'
-    else
-        XHTTP_SNI="${REALITY_SNI}"
-    fi
-    prompt_value EDGE_IPV4 'Public IPv4 of this Node' "${detected_ip}"
-    prompt_value NODE_PORT 'Node API port (Panel control plane only)' '3334'
+    ENABLE_SELF_REALITY=1
+    ENABLE_EXTERNAL_REALITY=1
+    ENABLE_XHTTP=1
+    ENABLE_HYSTERIA=1
+    ENABLE_RAW_FRAGMENT=1
+    FRAGMENT_REALITY='external'
+    BLOCK_CLIENT_QUIC=1
+    APPLY_TUNING=1
+    CLIENT_FINGERPRINT='firefox'
+    ui_section 'Параметры' 'транспорты уже зафиксированы: 4 inbound и 5 Host'
+    prompt_value REALITY_SNI 'Домен сайта и self-SNI'
+    prompt_value XHTTP_SNI 'Второй домен для XHTTP/Hysteria2'
+    prompt_value EDGE_IPV4 'Публичный IPv4 этой Node' "${detected_ip}"
+    prompt_value PANEL_IPV4 'Исходящий IPv4 Remnawave Panel' "${PANEL_IPV4}"
+    prompt_value ACME_EMAIL "Email для Let's Encrypt" "${ACME_EMAIL}"
+    prompt_value NODE_PORT 'Порт API Node (только для Panel)' '3334'
     default_node_name="${REALITY_SNI%%.*}"
     default_node_name="$(printf '%s' "${default_node_name}" | tr '[:upper:]_' '[:lower:]-' | \
         tr -cd 'a-z0-9-' | cut -c1-24)"
     default_node_name="${default_node_name:-edge-node}"
     NODE_SLUG="${NODE_SLUG:-${default_node_name}}"
+    prompt_value NODE_SLUG 'Короткое имя Node' "${NODE_SLUG}"
     REALITY_SNI="${REALITY_SNI,,}"
     XHTTP_SNI="${XHTTP_SNI,,}"
     CLIENT_FINGERPRINT="${CLIENT_FINGERPRINT,,}"
@@ -2927,9 +2948,9 @@ init_stage() {
     generate_material
     render_validate_transaction
     write_state
-    success "Initialization complete in ${INSTALL_DIR}."
-    ui_file 'Next: create the Config Profile and Node using this guide' \
-        "${PRIVATE_DIR}/PANEL-STAGE-1.txt"
+    success "Конфигурация создана в ${INSTALL_DIR}."
+    ui_file 'Поля Config Profile, Node и пяти Host' \
+        "${PRIVATE_DIR}/PANEL-HOSTS.txt"
 }
 
 panel_stage() {
@@ -2938,17 +2959,16 @@ panel_stage() {
     load_state
     validate_loaded_state
     render_happ_rules
-    render_panel_stage_one
-    render_panel_stage_two
-    ui_file 'Panel stage 1 guide' "${PRIVATE_DIR}/PANEL-STAGE-1.txt"
-    if [[ -f "${PRIVATE_DIR}/PANEL-STAGE-2.txt" ]]; then
-        ui_file 'Panel stage 2 guide' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
+    render_panel_guides_ru
+    ui_file 'Поля физических Host' "${PRIVATE_DIR}/PANEL-HOSTS.txt"
+    if [[ -f "${PRIVATE_DIR}/PANEL-AUTO.txt" ]]; then
+        ui_file 'Подключение AUTO' "${PRIVATE_DIR}/PANEL-AUTO.txt"
     fi
     printf '\n'
-    sed -n '1,240p' "${PRIVATE_DIR}/PANEL-STAGE-1.txt"
-    if [[ -f "${PRIVATE_DIR}/PANEL-STAGE-2.txt" ]]; then
+    sed -n '1,240p' "${PRIVATE_DIR}/PANEL-HOSTS.txt"
+    if [[ -f "${PRIVATE_DIR}/PANEL-AUTO.txt" ]]; then
         printf '\n'
-        sed -n '1,240p' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
+        sed -n '1,240p' "${PRIVATE_DIR}/PANEL-AUTO.txt"
     fi
 }
 
@@ -2965,16 +2985,16 @@ save_node_secret() {
          }
          END {exit !(count == 1 && valid == 1)}
        ' "${PRIVATE_DIR}/node.env"; then
-        log 'Reusing the protected Node SECRET_KEY already saved by the previous attempt.'
+        log 'Использую защищённый SECRET_KEY, сохранённый предыдущей попыткой.'
         return 0
     fi
     if [[ -z "${secret}" ]]; then
         if [[ "${NON_INTERACTIVE}" == 1 || ! -t 0 ]]; then
             die 'RW_NODE_SECRET_KEY is required for the node stage.'
         fi
-        printf '%b?%b Paste the SECRET_KEY issued by this Node object in Panel: ' \
+        printf '%b?%b Вставьте SECRET_KEY, выданный объектом Node в Panel: ' \
             "${UI_CYAN}${UI_BOLD}" "${UI_RESET}"
-        IFS= read -r -s secret || die 'SECRET_KEY input was interrupted.'
+        IFS= read -r -s secret || die 'Ввод SECRET_KEY был прерван.'
         printf '\n'
     fi
     [[ ${#secret} -ge 32 ]] || die 'SECRET_KEY is unexpectedly short.'
@@ -3022,7 +3042,7 @@ wait_for_node_ready() {
         [[ "${ENABLE_HYSTERIA}" != 1 ]] || udp_port_is_listening 443 || ready=0
         panel_control_observed || ready=0
         if [[ "${ready}" == 1 ]]; then
-            log 'Node API, all selected Xray transports and a successful Panel management exchange are ready.'
+            log 'API Node, четыре транспорта Xray и mTLS-связь с Panel готовы.'
             return 0
         fi
         sleep 2
@@ -3041,7 +3061,7 @@ ensure_caddy_certificates() {
 
     if ! container_is_running "${HAPROXY_CONTAINER}"; then
         STAGE_STOP_HAPROXY=1
-        log 'Starting HAProxy so Caddy can complete public TLS-ALPN validation...'
+        log 'Запускаю HAProxy для публичной TLS-ALPN проверки Caddy.'
         docker compose --env-file "${PRIVATE_DIR}/edge.env" \
             -f "${INSTALL_DIR}/docker-compose.edge.yml" up -d haproxy
     fi
@@ -3050,7 +3070,7 @@ ensure_caddy_certificates() {
 
     if ! container_is_running "${CADDY_CONTAINER}"; then
         STAGE_STOP_CADDY=1
-        log 'Starting Caddy to issue publicly trusted certificates before Node/Xray...'
+        log 'Запускаю Caddy и получаю публичные сертификаты до старта Node/Xray.'
         docker compose --env-file "${PRIVATE_DIR}/edge.env" \
             -f "${INSTALL_DIR}/docker-compose.edge.yml" up -d caddy
     else
@@ -3070,7 +3090,7 @@ ensure_caddy_certificates() {
         }
     fi
     validate_hysteria_material
-    success "Caddy certificate for Hysteria2 (${XHTTP_SNI}) is public, current and key-matched."
+    success "Сертификат Hysteria2 (${XHTTP_SNI}) публичный, действующий и соответствует ключу."
 }
 
 check_negative_mtls() {
@@ -3150,7 +3170,7 @@ apply_tuning_loaded() {
         die 'TCP receive autotuning ceiling did not become 32 MiB.'
     [[ "$(sysctl -n net.ipv4.tcp_wmem | awk '{print $3}')" == 33554432 ]] || \
         die 'TCP send autotuning ceiling did not become 32 MiB.'
-    log "Applied reversible BBR, live fq on ${default_interface}, MTU probing, 32 MiB TCP autotuning, backlog and UDP buffers."
+    log "Применены BBR, live fq на ${default_interface}, MTU probing, TCP autotuning 32 MiB и UDP-буферы."
 }
 
 tune_stage() {
@@ -3281,25 +3301,51 @@ node_stage() {
     wait_for_node_ready
     check_negative_mtls
     commit_stage
-    success 'Node stage passed. Create the canary squad/user and all enabled physical Hosts in Panel.'
-    ui_file 'Exact Host fields and next checkpoint' "${PRIVATE_DIR}/PANEL-STAGE-1.txt"
+    success 'Node подключена к Panel; четыре inbound запущены.'
 }
 
 template_stage() {
+    local variable label value
+    local -A seen_uuid=()
     announce_stage template
     require_root
     load_state
     validate_loaded_state
+    for variable in RAW_HOST_UUID EXTERNAL_REALITY_HOST_UUID RAW_FRAGMENT_HOST_UUID \
+      XHTTP_HOST_UUID HYSTERIA_HOST_UUID; do
+        case "${variable}" in
+            RAW_HOST_UUID) label='UUID Host 1 — REALITY SELF-SNI' ;;
+            EXTERNAL_REALITY_HOST_UUID) label='UUID Host 2 — REALITY EXTERNAL' ;;
+            RAW_FRAGMENT_HOST_UUID) label='UUID Host 3 — REALITY EXTERNAL + FINALMASK' ;;
+            XHTTP_HOST_UUID) label='UUID Host 4 — XHTTP/TLS' ;;
+            HYSTERIA_HOST_UUID) label='UUID Host 5 — HYSTERIA2' ;;
+        esac
+        value="${!variable:-}"
+        while ! validate_uuid "${value}"; do
+            [[ "${NON_INTERACTIVE}" != 1 && -t 0 ]] || \
+                die "Для ${label} нужен корректный UUID."
+            [[ -z "${value}" ]] || warn 'Формат UUID неверен, повторите ввод.'
+            value=''
+            prompt_value value "${label}"
+            value="${value,,}"
+        done
+        value="${value,,}"
+        [[ -z "${seen_uuid[${value}]:-}" ]] || die "UUID ${value} введён дважды."
+        seen_uuid["${value}"]=1
+        printf -v "${variable}" '%s' "${value}"
+    done
+    write_state
     render_happ_rules
     render_auto_template
-    render_panel_stage_two
+    render_panel_guides_ru
     [[ -s "${PRIVATE_DIR}/xray-json-auto.ready.json" ]] || die 'AUTO template was not rendered.'
     jq empty "${PRIVATE_DIR}/xray-json-auto.ready.json"
     validate_auto_template_model "${PRIVATE_DIR}/xray-json-auto.ready.json"
-    success 'XRAY_JSON AUTO template rendered and validated without UUID input.'
-    ui_file 'Ready template' "${PRIVATE_DIR}/xray-json-auto.ready.json"
-    ui_file 'Exact Panel steps' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
-    if [[ "${SHOW_VALUES}" == 1 ]]; then sed -n '1,240p' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"; fi
+    validate_artifacts
+    success 'AUTO-шаблон с пятью точными UUID создан и проверен.'
+    ui_file 'Готовый Xray JSON Template' "${PRIVATE_DIR}/xray-json-auto.ready.json"
+    ui_file 'Финальные действия в Panel' "${PRIVATE_DIR}/PANEL-AUTO.txt"
+    if [[ "${SHOW_VALUES}" == 1 ]]; then sed -n '1,240p' "${PRIVATE_DIR}/PANEL-AUTO.txt"; fi
 }
 
 wait_for_public_tls() {
@@ -3372,7 +3418,7 @@ edge_stage() {
     container_is_running "${HAPROXY_CONTAINER}" && haproxy_was_running=1
     container_is_running "${CADDY_CONTAINER}" && caddy_was_running=1
     if [[ "${haproxy_was_running}" == 1 && "${caddy_was_running}" == 1 ]]; then
-        log 'Existing edge containers found; verifying in place instead of silently recreating production.'
+        log 'Edge-контейнеры уже запущены; проверяю их без пересоздания.'
         verify_stage
         return 0
     fi
@@ -3381,13 +3427,13 @@ edge_stage() {
     arm_stage_rollback edge
     apply_firewall
 
-    log 'Starting HAProxy first so TLS-ALPN validation has a public TCP/443 path...'
+    log 'Запускаю HAProxy на публичном TCP/443.'
     [[ "${haproxy_was_running}" == 1 ]] || STAGE_STOP_HAPROXY=1
     docker compose --env-file "${PRIVATE_DIR}/edge.env" \
         -f "${INSTALL_DIR}/docker-compose.edge.yml" up -d haproxy
     wait_for_owned_tcp_listener 443 "${HAPROXY_CONTAINER}" || \
         die 'HAProxy did not bind public TCP/443 within 10 seconds.'
-    log 'Starting Caddy and obtaining trusted certificates...'
+    log 'Запускаю Caddy и проверяю доверенные сертификаты.'
     [[ "${caddy_was_running}" == 1 ]] || STAGE_STOP_CADDY=1
     docker compose --env-file "${PRIVATE_DIR}/edge.env" \
         -f "${INSTALL_DIR}/docker-compose.edge.yml" up -d caddy
@@ -3535,7 +3581,7 @@ verify_stage() {
         [[ "${decoy_code}" == 404 ]] || die "Decoy XHTTP route returned ${decoy_code}, expected 404."
         check_runtime_path
     fi
-    log 'PASS: DNS, mTLS control plane, all selected listeners, cover HTTPS and transport routing.'
+    log 'PASS: DNS, mTLS, listener, HTTPS-сайт и маршрутизация транспортов исправны.'
 }
 
 render_reality_auth_client() {
@@ -3709,7 +3755,7 @@ run_transport_test() {
         --socks5-hostname "127.0.0.1:${port}" --output /dev/null \
         --write-out '%{http_code}' 'https://8.8.8.8/generate_204' 2>/dev/null || true)"
     [[ "${code}" == 204 ]] || die "${name} authenticated probe returned ${code:-no-response}."
-    log "PASS: ${name} authenticated public-443 tunnel reached external HTTPS."
+    log "PASS: ${name} — авторизованный туннель через 443 достиг внешнего HTTPS."
     docker stop --time 2 "${container}" >/dev/null
 }
 
@@ -3829,7 +3875,7 @@ verify_auth_stage() {
         validate_client_config "${hysteria_config}"
         run_transport_test 'Hysteria2' "${hysteria_test_container}" "${HYSTERIA_TEST_PORT}" "${hysteria_config}"
     fi
-    success 'PASS: all selected authenticated transports work; credentials were not displayed.'
+    success 'PASS: все пять клиентских путей работают; учётные данные не выводились.'
     trap - EXIT RETURN
     auth_cleanup
 }
@@ -4083,26 +4129,27 @@ bootstrap_stage() {
         fi
     fi
     systemctl enable --now docker
-    log 'Base tools are installed. The Node stage will preserve SSH and enable the generated UFW policy automatically.'
+    log 'Пакеты установлены. Доступ SSH будет сохранён, UFW настроится автоматически.'
 }
 
 all_stage() {
     announce_stage all
     if ! base_commands_ready; then
-        log 'Missing base packages detected; running bootstrap first.'
+        log 'Устанавливаю системные пакеты и Docker.'
         bootstrap_stage
     fi
     init_stage
     load_state
-    panel_stage
-    wait_for_enter 'Create the Config Profile and Node in Panel, then copy its SECRET_KEY.'
+    printf '\n'
+    sed -n '1,260p' "${PRIVATE_DIR}/PANEL-HOSTS.txt"
+    wait_for_enter 'Создайте в Panel профиль, Node, canary squad, пользователя и ровно пять Host по инструкции выше.'
     node_stage
-    wait_for_enter 'Create the canary squad/user and all enabled physical Hosts in Panel.'
     template_stage
-    sed -n '1,240p' "${PRIVATE_DIR}/PANEL-STAGE-2.txt"
-    wait_for_enter 'Attach the AUTO template, create the AUTO Host, and verify the canary subscription.'
+    sed -n '1,240p' "${PRIVATE_DIR}/PANEL-AUTO.txt"
+    wait_for_enter 'Добавьте AUTO-шаблон и единственный виртуальный AUTO Host по инструкции выше.'
     edge_stage
     verify_auth_stage
+    success 'Установка завершена: четыре inbound, пять UUID в AUTO и все транспорты прошли проверку.'
 }
 
 check_repository_secret_hygiene() {
@@ -4169,41 +4216,40 @@ selftest_stage() {
     HAPROXY_CONTAINER='rw-edge-haproxy-a1b2c3d4'
     CADDY_CONTAINER='rw-edge-caddy-a1b2c3d4'
     COMPOSE_PROJECT='rw-edge-a1b2c3d4'
-    RAW_HOST_UUID='11111111-1111-4111-8111-111111111111'
-    EXTERNAL_REALITY_HOST_UUID='66666666-6666-4666-8666-666666666666'
-    RAW_FRAGMENT_HOST_UUID='55555555-5555-4555-8555-555555555555'
-    XHTTP_HOST_UUID='22222222-2222-4222-8222-222222222222'
-    HYSTERIA_HOST_UUID='44444444-4444-4444-8444-444444444444'
-    EXTRA_HOST_UUIDS='33333333-3333-4333-8333-333333333333'
+    RAW_HOST_UUID=''
+    EXTERNAL_REALITY_HOST_UUID=''
+    RAW_FRAGMENT_HOST_UUID=''
+    XHTTP_HOST_UUID=''
+    HYSTERIA_HOST_UUID=''
     pull_images
     generate_material
     write_state
     render_all_files
     ensure_node_env_placeholder
-    validate_artifacts
-    ENABLE_HYSTERIA=0
-    HYSTERIA_HOST_UUID=''
+    [[ ! -e "${PRIVATE_DIR}/xray-json-auto.ready.json" ]] || \
+        die 'AUTO ready-файл появился до ввода пяти UUID.'
+    RAW_HOST_UUID='11111111-1111-4111-8111-111111111111'
+    EXTERNAL_REALITY_HOST_UUID='66666666-6666-4666-8666-666666666666'
+    RAW_FRAGMENT_HOST_UUID='55555555-5555-4555-8555-555555555555'
+    XHTTP_HOST_UUID='22222222-2222-4222-8222-222222222222'
+    HYSTERIA_HOST_UUID='44444444-4444-4444-8444-444444444444'
+    write_state
     render_all_files
     validate_artifacts
     bash -n "${BASH_SOURCE[0]}"
     check_repository_secret_hygiene
-    success 'PASS: isolated render-only selftest; no firewall, DNS or service state was changed.'
+    success 'PASS: изолированная генерация прошла; сервисы, DNS и UFW не изменялись.'
     trap - EXIT RETURN
     selftest_cleanup
 }
 
 main() {
-    local command="${1:-}" started_at="${SECONDS}"
-    SELECTED_COMMAND=''
+    local command="${1:-all}" started_at="${SECONDS}"
     ui_init
     show_banner
-    if [[ -z "${command}" && "${UI_TTY}" == 1 ]]; then
-        choose_command
-        command="${SELECTED_COMMAND}"
-    fi
     set_paths
     case "${command}" in
-        -h|--help|help|'') ;;
+        -h|--help|help) ;;
         *) acquire_global_lock ;;
     esac
     case "${command}" in
@@ -4218,18 +4264,18 @@ main() {
         tune) tune_stage ;;
         untune) untune_stage ;;
         status) status_stage ;;
-        all) all_stage ;;
         rollback) rollback_stage ;;
         rollback-host) rollback_host_stage ;;
         selftest) selftest_stage ;;
-        -h|--help|help|'') usage ;;
+        install|all) all_stage ;;
+        -h|--help|help) usage ;;
         *) usage >&2; die "Unknown command: ${command}" ;;
     esac
     case "${command}" in
-        -h|--help|help|'') ;;
+        -h|--help|help) ;;
         *)
             ui_rule
-            success "Command '${command}' completed in $((SECONDS - started_at))s."
+            success "Команда '${command}' завершена за $((SECONDS - started_at)) с."
             ;;
     esac
 }
